@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install jq shellcheck
+          # macOS ships bash 3.2 — install 5.x so the bash-3.2-compat
+          # guards are *also* validated by running the suite on stock bash.
+          brew install bash
+
+      - name: Install deps (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: choco install -y jq
+
+      - name: Build from src/ modules
+        shell: bash
+        run: bash build.sh
+
+      - name: Syntax-check on stock bash (macOS bash 3.2)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          /bin/bash -n bin/novrix || true
+          /bin/bash -c "bin/novrix --version" 2>&1 | head -2 || true
+
+      - name: Run offline test suite
+        shell: bash
+        run: bash tests/smoke.sh
+
+      - name: Lint (shellcheck, Linux)
+        if: runner.os == 'Linux'
+        run: make lint
+
+      - name: Verify built artifact is current
+        shell: bash
+        run: |
+          cp bin/novrix /tmp/novrix.before
+          bash build.sh /tmp/novrix.after
+          diff /tmp/novrix.before /tmp/novrix.after || \
+            (echo "::error::bin/novrix is stale — run 'bash build.sh' and commit it" && exit 1)

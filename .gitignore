@@ -1,0 +1,17 @@
+# OS noise
+.DS_Store
+Thumbs.db
+
+# editor noise
+*.swp
+*~
+.idea/
+.vscode/
+
+# local caches / logs
+*.log
+novrix-cache/
+
+# secrets — never commit API keys
+keys.conf
+*.key

@@ -1,0 +1,2865 @@
+#!/usr/bin/env bash
+#
+# novrix — a fast, tiny CLI for NOVRIX public market data (novrix.io)
+#
+#   market data:  fg nupl mvrv tvl …   (60+ commands)
+#   AI agent:     novrix ai "ask anything"
+#   typos:        novrix mvvrv  →  auto-understood, fixed, and run
+#
+# Dependencies: bash 4+, curl, jq. No account, no API key for market data.
+#
+# Source layout (this file is assembled by build.sh from src/ modules):
+#   src/header.sh        shebang + banner
+#   src/lib/bootstrap.sh runtime guards, constants, colors
+#   src/lib/core.sh      helpers: die, need_cmd, spinner, options, cache
+#   src/lib/api.sh       api_get — fixtures, caching, curl
+#   src/lib/format.sh    jq snippets + render helpers
+#   src/lib/data.sh      SERIES / META / ALIASES registries
+#   src/lib/telegram.sh  telegram channel reader (t.me/s, no key)
+#   src/lib/ai.sh        DeepSeek AI agent
+#   src/lib/typo.sh      troll easter egg + fuzzy/AI typo resolution
+#   src/lib/commands.sh  every cmd_* implementation
+#   src/lib/cli.sh       dispatch, REPL, entry point
+#
+# Build:  bash build.sh   →   bin/novrix
+# Test:   bash tests/smoke.sh
+
+# ---------------------------------------------------------------------------
+# bootstrap — runtime guards, constants, colors
+# (part of the novrix CLI; see src/header.sh for build notes)
+# ---------------------------------------------------------------------------
+
+set -euo pipefail 2>/dev/null || set -eu   # tolerant of bash < 4.0 pipefail
+
+readonly PROG="novrix"
+readonly VERSION="1.0.0"
+
+# bash 3.2 (the version Apple ships on macOS) lacks associative arrays and
+# other features we rely on — fail fast with a fix instead of a wall of
+# confusing errors. This guard runs before the registries in data.sh load.
+if (( BASH_VERSINFO[0] < 4 )); then
+  printf 'error: %s needs bash 4+ (found %s).\n' "$PROG" "${BASH_VERSION:-unknown}"
+  printf '  macOS ships bash 3.2, install a newer one, then run it explicitly:\n'
+  printf '    brew install bash\n'
+  printf '    /opt/homebrew/bin/bash %s ...\n' "${BASH_SOURCE[0]:-$0}"
+  printf '  or install novrix again (install.sh handles this for you).\n'
+  exit 1
+fi
+
+readonly BASE_URL="${NOVRIX_API_BASE:-https://novrix.io}"
+readonly CACHE_ROOT="${NOVRIX_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/$PROG}"
+readonly UA="$PROG/$VERSION (+https://novrix.io)"
+readonly CURL_TIMEOUT=20
+# response cache TTL in seconds — overridable via NOVRIX_TTL (die() is not
+# defined yet at this point, so validate with a plain printf + exit)
+readonly DEFAULT_TTL="${NOVRIX_TTL:-300}"
+if ! [[ "$DEFAULT_TTL" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s: NOVRIX_TTL must be a positive integer (seconds), got %s\n' "$PROG" "$NOVRIX_TTL" >&2
+  exit 1
+fi
+
+# metrilytics endpoints require this version stamp
+readonly META_V="full-history-20260513b"
+
+# AI agent (DeepSeek)
+readonly DEEPSEEK_BASE="${DEEPSEEK_API_BASE:-https://api.deepseek.com}"
+readonly CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$PROG"
+readonly KEYS_FILE="$CONF_DIR/keys.conf"
+
+# options
+opt_json=0
+opt_fresh=0
+opt_days=""
+opt_top=""
+opt_months=""
+
+# colors — only when stdout is a TTY and NO_COLOR is not set
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  c_reset=$'\e[0m'; c_dim=$'\e[2m'; c_bold=$'\e[1m'
+  c_red=$'\e[31m'; c_yellow=$'\e[33m'; c_green=$'\e[32m'
+else
+  c_reset=""; c_dim=""; c_bold=""; c_red=""; c_yellow=""; c_green=""
+fi
+
+# ---------------------------------------------------------------------------
+# core — shared helpers: die, need_cmd, emit_json, pos_int, spinner, options
+# ---------------------------------------------------------------------------
+
+die() {
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "requires '$1', install it and try again"
+}
+
+# print raw API body on --json, then stop (used by every command)
+emit_json() {
+  if (( opt_json )); then
+    printf '%s\n' "$1"
+    return 0
+  fi
+  return 1
+}
+
+pos_int() { # pos_int <value> <flag-name>
+  [[ "$1" =~ ^[1-9][0-9]*$ ]] || die "--$2 must be a positive integer, got '$1'"
+}
+
+# spinner_run <message> <command...> — runs <command> with an animated
+# spinner on stderr while it works, then replays the command's own stderr
+# (errors, setup hints) and stdout. Returns the command's rc.
+#
+# The animation only runs when stderr is a terminal ([[ -t 2 ]]) — piped or
+# captured output gets zero spinner noise. When it does animate, every
+# frame first erases the line (\r\033[2K), so cycling to a shorter status
+# text can never leave a tail of the original message on screen.
+#
+# The animation is a tiny braille "orb" (10 frames, one full turn, reads
+# like a spinning globe) and the status text rotates every ~1.5 s:
+# <message> → "thinking..." → "working..." → "answering in a sec..." →
+# "wait, novrix is analyzing in depth...". The longer a call takes, the
+# more texts it cycles through, so a slow AI answer always looks alive.
+spinner_run() {
+  local msg="$1"; shift
+  local out err pid rc
+  out="$(mktemp "${TMPDIR:-/tmp}/$PROG-spin-XXXXXX")" || die "mktemp failed"
+  err="$(mktemp "${TMPDIR:-/tmp}/$PROG-spin-XXXXXX")" || die "mktemp failed"
+  "$@" >"$out" 2>"$err" &
+  pid=$!
+  if [[ -t 2 ]]; then
+    _spinner_animate "$msg" "$pid"
+  fi
+  if wait "$pid" 2>/dev/null; then rc=0; else rc=$?; fi
+  # replay anything the command wrote to stderr (errors, setup hints)
+  if [[ -s "$err" ]]; then cat "$err" >&2; fi
+  cat "$out"
+  rm -f "$out" "$err"
+  return "$rc"
+}
+
+# _spinner_animate <message> <pid> — draws the spinner frames on stderr
+# while <pid> is alive. Separate from spinner_run so the smoke suite can
+# exercise the animation logic directly. Every frame erases the line first
+# (\r\033[2K) so a shorter status text never leaves a tail of the message
+# visible — "reading techleaks..." followed by "working..." must not show
+# the leftover "techleaks..." text. Always clears the line at the end.
+_spinner_animate() {
+  local msg="$1" pid="$2" max="${3:-0}"
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local statuses=("$msg" 'thinking...' 'working...' 'answering in a sec...' 'wait, novrix is analyzing in depth...')
+  local si=0 i=0 t=0
+  printf '\r\033[2K%s %s' "$msg" "${frames[0]}" >&2
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r\033[2K%s %s' "${statuses[si]}" "${frames[i]}" >&2
+    i=$(( (i + 1) % ${#frames[@]} ))
+    t=$(( t + 1 ))
+    if (( t % 15 == 0 )); then
+      si=$(( (si + 1) % ${#statuses[@]} ))
+    fi
+    if (( max > 0 && t >= max )); then break; fi
+    sleep 0.1
+  done
+  printf '\r\033[2K' >&2
+}
+
+# age of a file in minutes — portable across GNU stat, BSD/macOS stat,
+# and busybox stat. Prints an integer; 0 when the file is missing.
+file_age_min() {
+  local f="$1" now age
+  now="$(date +%s 2>/dev/null || echo 0)"
+  [[ -f "$f" ]] || { echo 0; return 0; }
+  if stat -c %Y "$f" >/dev/null 2>&1; then
+    age=$(( now - $(stat -c %Y "$f") ))
+  elif stat -f %m "$f" >/dev/null 2>&1; then
+    age=$(( now - $(stat -f %m "$f") ))
+  else
+    age=0
+  fi
+  (( age < 0 )) && age=0
+  echo $(( age / 60 ))
+}
+
+parse_opts() {
+  local a
+  opt_json=0; opt_fresh=0; opt_days=""; opt_top=""; opt_months=""
+  while [[ $# -gt 0 ]]; do
+    a="$1"
+    case "$a" in
+      --json)        opt_json=1; shift ;;
+      --fresh)       opt_fresh=1; shift ;;
+      --days)        [[ $# -ge 2 ]] || die "--days needs a number"; opt_days="$2"; shift 2 ;;
+      --days=*)      opt_days="${a#*=}"; shift ;;
+      --top)         [[ $# -ge 2 ]] || die "--top needs a number"; opt_top="$2"; shift 2 ;;
+      --top=*)       opt_top="${a#*=}"; shift ;;
+      --months)      [[ $# -ge 2 ]] || die "--months needs a number"; opt_months="$2"; shift 2 ;;
+      --months=*)    opt_months="${a#*=}"; shift ;;
+      -h|--help)     usage; exit 0 ;;
+      --version)     print_version; exit 0 ;;
+      *)             die "unknown option: $a" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# api — HTTP access to novrix.io with an offline fixture mode and a local
+# response cache. The freshness check is portable across GNU/macOS/busybox
+# stat (no reliance on `find -mmin`, which BSD/macOS find lacks).
+# ---------------------------------------------------------------------------
+api_get() {
+  local path="$1" ttl="${2:-$DEFAULT_TTL}"
+  local key file
+
+  # Offline / fixture mode (used by tests and demos): NOVRIX_API_DIR=<dir>
+  if [[ -n "${NOVRIX_API_DIR:-}" ]]; then
+    key="$(printf '%s' "$path" | tr -c '[:alnum:]' '_')"
+    file="$NOVRIX_API_DIR/$key.json"
+    [[ -f "$file" ]] || die "fixture not found: $file (NOVRIX_API_DIR=$NOVRIX_API_DIR)"
+    cat "$file"
+    return 0
+  fi
+
+  key="$(printf '%s' "$path" | tr -c '[:alnum:]' '_')"
+  file="$CACHE_ROOT/$key.json"
+  mkdir -p "$CACHE_ROOT"
+
+  # serve from cache while it is younger than ttl (rounded up to whole minutes)
+  if [[ "$opt_fresh" != 1 && -f "$file" ]] \
+     && (( $(file_age_min "$file") < (ttl + 59) / 60 )); then
+    cat "$file"
+    return 0
+  fi
+
+  local body
+  body="$(curl -sS --connect-timeout 10 --max-time "$CURL_TIMEOUT" -A "$UA" "$BASE_URL$path")" \
+    || die "network error fetching $path (curl exit $?)"
+
+  if ! jq -e '.success == true' <<<"$body" >/dev/null 2>&1; then
+    printf '%s\n' "$body" >&2
+    die "unexpected API response for $path, is novrix.io up, or are we being rate-limited?"
+  fi
+
+  printf '%s\n' "$body" >"$file"
+  printf '%s\n' "$body"
+}
+
+# ---------------------------------------------------------------------------
+# format — shared jq snippets and small render helpers
+# ---------------------------------------------------------------------------
+
+# jq snippet: abbreviate a USD number (e.g. 1179803014 -> 1.18B)
+readonly JQ_ABBR='def abbr: if . < 0 then ("-" + ((-.)|abbr)) elif . >= 1e12 then ((./1e12*100|round/100|tostring)+"T") elif . >= 1e9 then ((./1e9*100|round/100|tostring)+"B") elif . >= 1e6 then ((./1e6*100|round/100|tostring)+"M") elif . >= 1e3 then ((./1e3*100|round/100|tostring)+"K") else ((.*100|round/100|tostring)) end;'
+
+# jq snippets for the metrilytics summary (values arrive as strings)
+readonly JQ_META='def p2: ((.*100|round)/100|tostring); def p1: ((.*10|round)/10|tostring);'
+
+nupl_zone() {
+  local mv="$1"
+  if   (( mv >= 500 ));  then echo "Euphoria"
+  elif (( mv >= 250 ));  then echo "Greed"
+  elif (( mv >= 0 ));    then echo "Optimism"
+  elif (( mv >= -250 )); then echo "Anxiety"
+  elif (( mv >= -500 )); then echo "Fear"
+  else echo "Capitulation"; fi
+}
+
+pct() {
+  if [[ "$1" == "nan" ]]; then printf '%8s' "-"; return; fi
+  LC_ALL=C printf '%6.2f%%' "$1"
+}
+
+# like pct but unpadded, for single-line summaries
+fmtpct() {
+  if [[ "$1" == "nan" ]]; then printf -- "-"; return; fi
+  LC_ALL=C printf '%+.2f%%' "$1"
+}
+
+# format code -> jq expression formatting the value $v
+# shellcheck disable=SC2016  # these are jq programs — $v must stay literal
+series_val_expr() {
+  case "$1" in
+    usd)   echo '(if $v < 0 then "-$" + ((-$v)|abbr) else "$" + ($v|abbr) end)' ;;
+    abbr)  echo '($v|abbr)' ;;
+    num0)  echo '($v|round|tostring)' ;;
+    num1)  echo '(($v*10|round)/10|tostring)' ;;
+    num2)  echo '(($v*100|round)/100|tostring)' ;;
+    num3)  echo '(($v*1000|round)/1000|tostring)' ;;
+    num4)  echo '(($v*10000|round)/10000|tostring)' ;;
+    pct2)  echo '(($v*100|round)/100|tostring) + "%"' ;;
+    rate4) echo '(($v*100*10000|round)/10000|tostring) + "%"' ;;
+    *)     echo '($v|tostring)' ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# design — color helpers and table rules (all render plain when
+# piped — color codes are only set on a TTY)
+# ---------------------------------------------------------------------------
+
+# sign_col <value> — green for positive, red for negative, plain for "-"
+sign_col() {
+  case "$1" in
+    "-") printf '%s' "$c_reset" ;;
+    -*)  printf '%s' "$c_red" ;;
+    *)   printf '%s' "$c_green" ;;
+  esac
+}
+
+# fg_col <score> — zone color for a fear & greed score (0-100)
+fg_col() {
+  local score="$1"
+  if   (( score >= 75 )); then printf '%s' "$c_bold$c_green"
+  elif (( score >= 55 )); then printf '%s' "$c_green"
+  elif (( score >= 45 )); then printf '%s' "$c_reset"
+  elif (( score >= 25 )); then printf '%s' "$c_yellow"
+  else printf '%s' "$c_red"; fi
+}
+
+# hr <width> — a dim horizontal rule for table headers
+hr() {
+  local w="$1" s=""
+  printf -v s '%*s' "$w" ''
+  printf '%s%s%s\n' "$c_dim" "${s// /-}" "$c_reset"
+}
+
+# ---------------------------------------------------------------------------
+# data — the command registries. Kept as flat text tables (name|field|…)
+# so the CLI can stay small, predictable, and easy to extend: add one line
+# here and the command exists (usage/help/shortcuts/typo-matching all pick
+# it up automatically).
+# ---------------------------------------------------------------------------
+
+# series registry — generic time-series commands
+#   name|path|field|label|format|unit|period
+# format: usd ($+abbr) · abbr (no $) · num0/num1/num2/num4 decimals
+#         pct2 (two-dec %) · rate4 (funding-rate %)
+# period: daily (YYYY-MM-DD) | monthly (YYYY-MM)
+declare -A SERIES=(
+  # ---- crypto sentiment (fg + nupl are dedicated commands) ----
+  [mvrv]="/api/mvrv-zscore|value|MVRV Z-SCORE|num2||daily"
+  [sopr]="/api/sopr|sopr|SOPR|num3||daily"
+  [puell]="/api/puell-multiple|value|PUELL MULTIPLE|num2||daily"
+  [rhodl]="/api/rhodl-ratio|value|RHODL RATIO|num1||daily"
+  [mayer]="/api/mayer-multiple|value|MAYER MULTIPLE|num2||daily"
+  [reserve-risk]="/api/reserve-risk|value|RESERVE RISK|num4||daily"
+  [realized-price]="/api/realized-price|value|REALIZED PRICE|usd||daily"
+  [realized-profit]="/api/realized-profit|realized_profit|REALIZED PROFIT|usd||daily"
+  [realized-loss]="/api/realized-loss|realized_loss|REALIZED LOSS|usd||daily"
+  [market-cap]="/api/crypto-market-cap|value|CRYPTO MARKET CAP|usd||daily"
+  [btc-price]="/api/btc-price|price|BTC PRICE|usd||daily"
+  [200-week-ma]="/api/200-week-ma|value|200W MA|usd||daily"
+  [active-addresses]="/api/active-addresses|value|ACTIVE ADDRESSES|num0||daily"
+  [hashrate]="/api/hashrate|hashrate|HASHRATE|abbr|H/s|daily"
+  [stablecoin-supply]="/api/stablecoin-supply|value|STABLECOIN SUPPLY|usd||daily"
+  [open-interest]="/api/open-interest|value|BTC OPEN INTEREST|usd||daily"
+  [funding-rate]="/api/funding-rate|value|FUNDING RATE|rate4||daily"
+  [etf]="/api/etf|value|BTC ETF FLOWS|num0|BTC|daily"
+
+  # ---- macro (cpi is a dedicated command) ----
+  [unrate]="/api/fred-unrate|value|US UNEMPLOYMENT|pct2||monthly"
+  [gdp]="/api/fred-gdpc1|value|US GDP|num2||monthly"
+  [payrolls]="/api/fred-payems|value|NONFARM PAYROLLS|num0||monthly"
+  [claims]="/api/fred-icsa|value|INITIAL CLAIMS|num0||monthly"
+  [job-openings]="/api/fred-jtsjol|value|JOB OPENINGS|num0||monthly"
+  [core-cpi]="/api/fred-cpilfesl|value|CORE CPI|num2||monthly"
+  [pce]="/api/fred-pcepi|value|PCE PRICE INDEX|num2||monthly"
+  [core-pce]="/api/fred-pcepilfe|value|CORE PCE|num2||monthly"
+  [umich]="/api/fred-umcsent|value|U.MICH SENTIMENT|num2||monthly"
+  [oil]="/api/fred-dcoilwtico|value|WTI OIL|usd||daily"
+  [us30y]="/api/fred-dgs30|value|US 30Y YIELD|pct2||daily"
+  [t10y2y]="/api/fred-t10y2y|value|10Y-2Y SPREAD|pct2||daily"
+  [breakeven]="/api/fred-t10yie|value|10Y BREAKEVEN|pct2||daily"
+  [dxy]="/api/dxy|value|DOLLAR INDEX|num2||daily"
+  [gold]="/api/gold|value|GOLD|usd||daily"
+  [sp500]="/api/sp500|value|S&P 500|num2||daily"
+  [vix]="/api/vix|value|VIX|num2||daily"
+  [fedfunds]="/api/fedfunds|value|FED FUNDS RATE|pct2||monthly"
+  [m2]="/api/m2|value|M2 MONEY SUPPLY|usd||monthly"
+)
+
+# FRED series ids for the series that exist on fred.stlouisfed.org. Used by
+# the dated-question fallback: when novrix history does not reach a date,
+# fetch the observation straight from FRED (keyless fredgraph.csv export).
+# Series without an entry here (fg/nupl/tvl/…, and dxy/gold with no direct
+# FRED daily id) keep routing to the AI agent instead.
+declare -A FRED_ID=(
+  [unrate]="UNRATE"
+  [gdp]="GDPC1"
+  [payrolls]="PAYEMS"
+  [claims]="ICSA"
+  [job-openings]="JTSJOL"
+  [core-cpi]="CPILFESL"
+  [pce]="PCEPI"
+  [core-pce]="PCEPILFE"
+  [umich]="UMCSENT"
+  [oil]="DCOILWTICO"
+  [us30y]="DGS30"
+  [t10y2y]="T10Y2Y"
+  [breakeven]="T10YIE"
+  [cpi]="CPIAUCSL"
+  [fedfunds]="FEDFUNDS"
+  [m2]="M2SL"
+  [sp500]="SP500"
+  [vix]="VIXCLS"
+)
+
+# metrilytics summary one-liners — name -> jq program (summary fields are strings)
+declare -A META=(
+  [defi]='"DEFI TVL · $" + (.summary.total_defi_tvl|tonumber|abbr) + " · top: " + .summary.top_chain_by_tvl + " · " + .summary.top_protocol_by_tvl'
+  [stablecoins]='"STABLECOIN SUPPLY · $" + (.summary.total_stablecoin_supply|tonumber|abbr)'
+  [dex]='"DEX VOLUME 24H · $" + (.summary.total_dex_volume_24h|tonumber|abbr)'
+  [fees]='"PROTOCOL FEES 24H · $" + (.summary.protocol_fees_24h|tonumber|abbr) + " · revenue $" + (.summary.protocol_revenue_24h|tonumber|abbr)'
+  [options]='"OPTIONS VOLUME 24H · $" + (.summary.options_volume_24h|tonumber|abbr)'
+  [dominance]='"DOMINANCE · BTC " + (.summary.btc_dominance|tonumber|p2) + "% · ETH " + (.summary.eth_dominance|tonumber|p2) + "% · SOL " + (.summary.sol_dominance|tonumber|p2) + "%"'
+  [prices]='"PRICES · BTC $" + (.summary.btc_price|tonumber|abbr) + " · ETH $" + (.summary.eth_price|tonumber|abbr) + " · SOL $" + (.summary.sol_price|tonumber|abbr)'
+  [oi]='"OPEN INTEREST · BTC $" + (.summary.btc_open_interest|tonumber|abbr) + " · DEFI perps $" + (.summary.defi_perp_open_interest|tonumber|abbr)'
+)
+
+# short-name aliases — short -> canonical command name
+# canonical names (SERIES/META keys, cmd_* functions) stay the same; the
+# aliases below are the primary, easier-to-type names shown in the banner
+# and help. Long names keep working everywhere.
+declare -A ALIASES=(
+  # ---- crypto sentiment ----
+  [rr]="reserve-risk"
+  [rp]="realized-price"
+  [rpf]="realized-profit"
+  [rpl]="realized-loss"
+  [mcap]="market-cap"
+  [btc]="btc-price"
+  [200ma]="200-week-ma"
+  [addrs]="active-addresses"
+  [hash]="hashrate"
+  [scs]="stablecoin-supply"
+  [btoi]="open-interest"
+  [funding]="funding-rate"
+  # 'fear' / 'greed' are NOT aliases — they stay unknown so multi-word
+  # phrases like 'fear and greed index' reach the AI matcher as a whole.
+  # ---- macro ----
+  [nfp]="payrolls"
+  [jolts]="job-openings"
+  [ccpi]="core-cpi"
+  [cpce]="core-pce"
+  [t30]="us30y"
+  [curve]="t10y2y"
+  [be]="breakeven"
+  [spx]="sp500"
+  [ffr]="fedfunds"
+  # ---- metrilytics ----
+  [mkt]="market"
+  [stables]="stablecoins"
+  # ---- telegram ----
+  [tg]="telegram"
+  [dom]="dominance"
+  [opts]="options"
+  [prots]="protocols"
+)
+
+# ---------------------------------------------------------------------------
+# telegram — read the latest posts from a public Telegram channel through the
+# public preview page (t.me/s/<channel>). No bot token, no login: the page is
+# plain HTML, so any public channel works. Posts are cached for 8 hours — a
+# CLI refreshes lazily on the next call (see README for a cron line if you
+# want true background prefetching).
+#
+#   channel: NOVRIX_TELEGRAM_CHANNEL env, or 'TELEGRAM_CHANNEL=…' in keys.conf
+#   ttl:     NOVRIX_TELEGRAM_TTL minutes (default 480 = 8 hours)
+# ---------------------------------------------------------------------------
+
+readonly TG_TTL_MIN="${NOVRIX_TELEGRAM_TTL:-480}"
+if ! [[ "$TG_TTL_MIN" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s: NOVRIX_TELEGRAM_TTL must be a positive integer (minutes), got %s\n' "$PROG" "$NOVRIX_TELEGRAM_TTL" >&2
+  exit 1
+fi
+
+tg_channel() {
+  local ch="${NOVRIX_TELEGRAM_CHANNEL:-}"
+  if [[ -z "$ch" && -f "$KEYS_FILE" ]]; then
+    ch="$(sed -n 's/^[[:space:]]*TELEGRAM_CHANNEL[[:space:]]*=[[:space:]]*//p' "$KEYS_FILE" | tail -1 | tr -d '"\r ')"
+  fi
+  printf '%s' "$ch"
+}
+
+# fetch the t.me/s/<channel> page. Fixture mode: NOVRIX_API_DIR/_tg_<ch>.html
+# (used by the offline tests). Otherwise the local 8h cache, then the live page.
+tg_fetch() {
+  local channel="$1" key file html
+  key="$(printf '%s' "$channel" | tr -c '[:alnum:]' '_')"
+  if [[ -n "${NOVRIX_API_DIR:-}" ]]; then
+    file="$NOVRIX_API_DIR/_tg_$key.html"
+    [[ -f "$file" ]] || die "telegram fixture not found: $file (NOVRIX_API_DIR=$NOVRIX_API_DIR)"
+    cat "$file"
+    return 0
+  fi
+  file="$CACHE_ROOT/_tg_$key.html"
+  mkdir -p "$CACHE_ROOT"
+  if [[ "$opt_fresh" != 1 && -f "$file" ]] && (( $(file_age_min "$file") < TG_TTL_MIN )); then
+    cat "$file"
+    return 0
+  fi
+  html="$(curl -sS --connect-timeout 10 --max-time "$CURL_TIMEOUT" -A "$UA" "https://t.me/s/$channel")" \
+    || die "network error fetching telegram channel @$channel (curl exit $?)"
+  printf '%s\n' "$html" >"$file"
+  printf '%s\n' "$html"
+}
+
+# parse the page into posts. Each post becomes a blank-line-separated block of
+# marker lines ID|… / TS|… / TXT|… / IMG|… / FW|… (newlines inside TXT escaped
+# to \n so a block stays one paragraph). FW is set when the post was forwarded.
+tg_parse() {
+  awk '
+    BEGIN {
+      q  = sprintf("%c", 39)   # single quote (avoids shell quoting hell)
+      dq = sprintf("%c", 34)   # double quote
+      RS = "data-post="
+    }
+    NR > 1 {
+      id = ""; ts = ""; txt = ""; img = ""; fw = ""
+      if (match($0, /^"[^"]*"/)) id = substr($0, 1, RLENGTH)
+      gsub(/"/, "", id)
+      if (match($0, /datetime="[^"]*"/)) ts = substr($0, RSTART + 10, RLENGTH - 11)
+      if (match($0, /js-message_text"[^>]*>/)) {
+        rest = substr($0, RSTART + RLENGTH)
+        cl = index(rest, "</div>")
+        if (cl > 0) txt = substr(rest, 1, cl - 1)
+      }
+      gsub(/<br[^>]*>/, "\n", txt)
+      gsub(/<[^>]*>/, "", txt)
+      gsub(/&lt;/, "<", txt)
+      gsub(/&gt;/, ">", txt)
+      gsub(/&quot;/, "\"", txt)
+      gsub(/&#39;/, q, txt)
+      gsub(/&amp;/, "\\&", txt)   # last, so &lt; etc. stay intact (awk: \& = literal &)
+      # author line breaks are <br>; any other newlines are page wraps -> spaces
+      gsub(/\n[ \t]*\n/, "\001", txt)   # protect paragraph breaks (sentinel)
+      gsub(/\n/, " ", txt)                # HTML wraps become spaces
+      gsub(/\001/, "\n\n", txt)          # restore paragraph breaks
+      # forwarded-from marker (t.me wraps the source channel in a div)
+      if (match($0, /tgme_widget_message_forwarded_from[^>]*>/)) {
+        rest = substr($0, RSTART + RLENGTH)
+        cl = index(rest, "</div>")
+        if (cl > 0) fw = substr(rest, 1, cl - 1)
+        gsub(/<[^>]*>/, "", fw)
+        gsub(/&nbsp;/, " ", fw)
+        gsub(/&lt;/, "<", fw)
+        gsub(/&gt;/, ">", fw)
+        gsub(/&quot;/, "\"", fw)
+        gsub(/&#39;/, q, fw)
+        gsub(/&amp;/, "\\&", fw)   # awk: \& = literal &
+        gsub(/[ \t]+/, " ", fw)
+      }
+      if (match($0, /background-image:url\([^)]*\)/)) {
+        img = substr($0, RSTART, RLENGTH)
+        sub(/^background-image:url\(/, "", img)
+        sub(/\)$/, "", img)
+      } else if (match($0, /<img src=[^ >]+/)) {
+        img = substr($0, RSTART, RLENGTH)
+        sub(/^<img src=/, "", img)
+      }
+      gsub(q, "", img)
+      gsub(dq, "", img)
+      # inline emoji are rendered as telegram.org/img/emoji images — not charts
+      if (img ~ /\/img\/emoji\//) img = ""
+      if (txt != "" || img != "") {
+        gsub(/\n/, "\\n", txt)
+        printf "ID|%s\nTS|%s\nTXT|%s\nIMG|%s\nFW|%s\n\n", id, ts, txt, img, fw
+      }
+    }
+  '
+}
+
+# the newest post as one parsed block (or empty when nothing usable).
+# t.me/s pages list posts oldest-first, so the newest is the last block.
+tg_latest() {
+  local channel="$1"
+  tg_fetch "$channel" 2>/dev/null | tg_parse | awk -v RS='' '{last = $0} END {print last}'
+}
+
+# render parsed blocks (stdin, marker-line format) — the newest n posts
+# with headers. t.me/s lists posts oldest-first, so the newest n are the
+# LAST n blocks; they are buffered and printed at END, newest last.
+# text_only=1 drops chart urls (used for the natural-language answers).
+tg_show() {
+  local channel="$1" n="${2:-1}" text_only="${3:-0}"
+  awk -v RS='' -v ch="$channel" -v n="$n" -v t="$text_only" -v b="$c_bold" -v r="$c_reset" -v d="$c_dim" '
+    {
+      ts = ""; txt = ""; img = ""; fw = ""
+      nl = split($0, L, "\n")
+      for (i = 1; i <= nl; i++) {
+        if      (L[i] ~ /^TS\|/)  ts  = substr(L[i], 4)
+        else if (L[i] ~ /^TXT\|/) txt = substr(L[i], 5)
+        else if (L[i] ~ /^IMG\|/) img = substr(L[i], 5)
+        else if (L[i] ~ /^FW\|/)  fw  = substr(L[i], 4)
+      }
+      gsub(/\\n/, "\n", txt)
+      T[NR] = ts; X[NR] = txt; I[NR] = img; F[NR] = fw
+    }
+    END {
+      start = NR - n + 1
+      if (start < 1) start = 1
+      for (i = start; i <= NR; i++) {
+        if (i > start) printf "\n"
+        printf "%sTELEGRAM%s · @%s · %s\n", b, r, ch, T[i]
+        if (F[i] != "") printf "  %s%s%s\n", d, F[i], r
+        if (X[i] != "") printf "%s\n", X[i]
+        if (I[i] != "" && t != 1) printf "%schart:%s %s\n", d, r, I[i]
+      }
+    }
+  '
+}
+
+# "the one with utxo bands" → "utxo bands": everything after the last
+# pick-phrase ("the one with", "post about", "which post", "mention", …).
+# Returns empty when there was no subject ("which one is the latest post?").
+spec_topic() {
+  printf '%s' "$1" | sed -E 's/.*(the one (with|about|that|on)|one (with|about|mentioning|on)|post (with|about|mentioning|on)|posts about|which (one|post)|mention|mentions|mentioned)[[:space:]]+//; s/[?!.,:;]+[[:space:]]*$//; s/[[:space:]]+$//; s/^[[:space:]]+//'
+}
+
+# topic → lowercase significant keywords, stopwords stripped. Empty when the
+# subject was only filler ("which one is the latest post?" → nothing).
+spec_keywords() {
+  local t="$1" w
+  t="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/ /g; s/^ +| +$//g')"
+  t=" $t "
+  for w in the a an of on in with about that for to by from at is are was were be been being and or but not tell me you your please which one post posts latest newest recent most current mention mentions mentioned regarding says said talk talks talked speaking covered writes wrote; do
+    t="${t// $w / }"
+  done
+  printf '%s' "$t" | tr -s ' ' | sed -E 's/^ +| +$//g'
+}
+
+# keep only parsed blocks (marker format, stdin) whose text contains every
+# given keyword (space-separated, already lowercase)
+tg_filter() {
+  local kw="$1"
+  awk -v RS='' -v kw="$kw" '
+    {
+      txt = ""
+      nl = split($0, L, "\n")
+      for (i = 1; i <= nl; i++)
+        if (L[i] ~ /^TXT\|/) txt = tolower(substr(L[i], 5))
+      ok = 1
+      n = split(kw, W, " ")
+      for (i = 1; i <= n; i++)
+        if (txt !~ W[i]) { ok = 0; break }
+      if (ok) { if (k++) print ""; print $0 }
+    }
+  '
+}
+
+# "what's new on crypto?" → the latest post; "which are the last posts?" →
+# the last 5 posts. Text only — no images — and for the single-post case the
+# AI agent adds its own description on top of the post text. Forwarded posts
+# carry a "Forwarded from …" note. "tell me the one with utxo bands" → ONLY
+# that post (keyword match, else the AI picks the closest). Returns 0 when it
+# answered, 1 to let the AI agent handle it (no channel configured, nothing
+# posted, or not a match).
+answer_telegram_question() {
+  local q="$1" channel out txt ts text user desc fw plural=0 spec=0 n=5
+  q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+  # plural asks ("the last posts", "last 3 posts") come first — they also
+  # match the singular "latest post" substring. Any mention of "posts"
+  # (plural) is a list request: show the last 5 (or the requested number).
+  # "the one with X" / "which post about X" point at ONE post (handled below).
+  case "$q" in
+    *"posts"*) plural=1 ;;
+    *"the one with"*|*"the one about"*|*"the one on"*|*"the one that"* \
+    |*"one with"*|*"one about"*|*"post about"*|*"which post"*)
+      : ;;
+    *"which one"*|*"mention"*)
+      # weak pointers need post context — "which one is better, btc or eth?"
+      # is a normal question, not a post pick
+      case "$q" in
+        *"post"*|*"telegram"*|*"channel"*) : ;;
+        *) return 1 ;;
+      esac ;;
+    *"what's new"*|*"whats new"*|*"what is new"*|*"anything new"* \
+    |*"new on crypto"*|*"new in crypto"*|*"latest chart"*|*"latest post"* \
+    |*"last post"*|*"your chart"*|*"your post"*|*"your channel"* \
+    |*"on telegram"*|*"from telegram"*)
+      : ;;
+    *) return 1 ;;
+  esac
+  channel="$(tg_channel)"
+  [[ -n "$channel" ]] || return 1
+  case "$q" in
+    *"the one with"*|*"the one about"*|*"the one on"*|*"the one that"* \
+    |*"one with"*|*"one about"*|*"post about"*|*"posts about"*|*"which post"* \
+    |*"which one"*|*"mention"*)
+      spec=1 ;;
+  esac
+  if (( spec )); then
+    local topic kw matched block nums total pick idx
+    topic="$(spec_topic "$q")"
+    kw="$(spec_keywords "$topic")"
+    if [[ -n "$kw" ]]; then
+      out="$(tg_fetch "$channel" 2>/dev/null | tg_parse)"
+      matched="$(printf '%s' "$out" | tg_filter "$kw")"
+      if [[ -n "$matched" ]]; then
+        printf '%sPOST MATCH%s · @%s%s\n' "$c_bold" "$c_reset" "$channel" "${topic:+ · \"$topic\"}"
+        printf '%s\n' "$matched" | tg_show "$channel" 1 1
+        return 0
+      fi
+      # no keyword hit — ask the AI which post fits the description best
+      nums="$(printf '%s' "$out" | awk -v RS='' '
+        {
+          ts=""; txt=""
+          nl=split($0,L,"\n")
+          for (i=1;i<=nl;i++) {
+            if      (L[i] ~ /^TS\|/)  ts  = substr(L[i],4)
+            else if (L[i] ~ /^TXT\|/) txt = substr(L[i],5)
+          }
+          gsub(/\\n/," ",txt)
+          printf "%d. [%s] %s\n", NR, ts, txt
+        }
+      ')"
+      total="$(printf '%s' "$out" | awk -v RS='' 'END {print NR}')"
+      user="Here are the recent posts from the @$channel telegram channel:
+
+$nums
+
+The user asked: \"$q\" and wants to see the ONE post that best matches what they described.
+
+Reply with ONLY the number of that post. Plain text, no markdown, no em dashes."
+      pick="$(spinner_run "finding the post..." ai_chat "$AI_SYSTEM" "$user")"
+      idx="$(printf '%s' "$pick" | grep -oE '[0-9]+' | head -1)"
+      if [[ -z "$idx" || ! "$idx" =~ ^[0-9]+$ ]]; then
+        idx="$total"   # AI could not point (fixture/offline) → newest post
+      fi
+      (( idx < 1 )) && idx=1
+      (( idx > total )) && idx="$total"
+      block="$(printf '%s' "$out" | awk -v RS='' -v want="$idx" 'NR == want {print}')"
+      [[ -n "$block" ]] || return 1
+      printf '%sPOST MATCH%s · @%s\n' "$c_bold" "$c_reset" "$channel"
+      printf '%s\n' "$block" | tg_show "$channel" 1 1
+      return 0
+    fi
+    # subject was only filler — fall through to the normal list/latest logic
+  fi
+  if (( plural )); then
+    # "the last 3 posts" → 3, otherwise 5; capped at 20 (page shows ~20)
+    if [[ "$q" =~ ([0-9]+)[[:space:]]+posts? ]]; then
+      n="${BASH_REMATCH[1]}"
+      (( n > 20 )) && n=20
+    fi
+    out="$(tg_fetch "$channel" 2>/dev/null | tg_parse)"
+    [[ -n "$out" ]] || return 1
+    printf '%sLAST POSTS%s · @%s\n' "$c_bold" "$c_reset" "$channel"
+    printf '%s\n' "$out" | tg_show "$channel" "$n" 1
+    return 0
+  fi
+  out="$(tg_latest "$channel")" || return 1
+  [[ -n "$out" ]] || return 1
+  txt="$(printf '%s' "$out" | sed -n 's/^TXT|//p')"
+  ts="$(printf '%s' "$out" | sed -n 's/^TS|//p')"
+  fw="$(printf '%s' "$out" | sed -n 's/^FW|//p')"
+  [[ -n "$txt" ]] || return 1
+  text="$(printf '%b' "$txt")"   # \n sequences back to real newlines
+  printf '%sNEW ON TELEGRAM%s · @%s%s\n' "$c_bold" "$c_reset" "$channel" "${ts:+ · $ts}"
+  if [[ -n "$fw" ]]; then
+    printf '  %s%s%s\n' "$c_dim" "$fw" "$c_reset"
+  fi
+  printf '%s\n' "$text"
+  # the AI agent reads the post and adds its own description
+  user="The latest post from the @$channel telegram channel is:
+
+$text
+
+The user asked: \"$q\"
+
+Describe what is new: restate the point of the post and add a couple of sentences of useful context. Plain text, brief, no markdown, no em dashes."
+  desc="$(spinner_run "reading the channel..." ai_chat "$AI_SYSTEM" "$user")"
+  printf '%s\n' "$desc"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# privacy-coins channel (@techleaks24) — "is monero traceable?" or "dero?"
+# routes to an AI analysis of ALL the channel's recent posts. The channel
+# covers privacy coins: Dero is the only coin that is not traceable, Monero
+# has been traceable for a long time, and so on. Channel is
+# NOVRIX_PRIVACY_CHANNEL env or PRIVACY_CHANNEL= in keys.conf, default
+# techleaks24. Returns 0 when answered, 1 otherwise (falls back to the AI).
+# ---------------------------------------------------------------------------
+
+privacy_channel() {
+  local ch="${NOVRIX_PRIVACY_CHANNEL:-}"
+  if [[ -z "$ch" && -f "$KEYS_FILE" ]]; then
+    ch="$(sed -n 's/^[[:space:]]*PRIVACY_CHANNEL[[:space:]]*=[[:space:]]*//p' "$KEYS_FILE" | tail -1 | tr -d '"\r ')"
+  fi
+  printf '%s' "${ch:-techleaks24}"
+}
+
+# all recent posts of a channel as a numbered "N. [date] text" list,
+# newest last — ready to feed the AI as analysis context.
+channel_posts() {
+  local channel="$1" n="${2:-20}"
+  tg_fetch "$channel" 2>/dev/null | tg_parse | awk -v RS='' -v n="$n" '
+    {
+      ts = ""; txt = ""; fw = ""
+      nl = split($0, L, "\n")
+      for (i = 1; i <= nl; i++) {
+        if (L[i] ~ /^TS\|/)  ts  = substr(L[i], 4)
+        else if (L[i] ~ /^TXT\|/) txt = substr(L[i], 5)
+        else if (L[i] ~ /^FW\|/)  fw  = substr(L[i], 4)
+      }
+      gsub(/\\n/, "\n", txt)
+      T[NR] = ts; X[NR] = txt; F[NR] = fw
+    }
+    END {
+      start = NR - n + 1
+      if (start < 1) start = 1
+      for (i = start; i <= NR; i++) {
+        if (X[i] == "") continue
+        printf "%d. [%s] %s", ++k, T[i], X[i]
+        if (F[i] != "") printf "  (%s)", F[i]
+        printf "\n\n"
+      }
+    }
+  '
+}
+
+answer_privacy_question() {
+  local q="$1" channel posts user
+  q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+  case "$q" in
+    *monero*|*xmr*|*dero*|*privacy*|*"private coin"*|*zcash*|*zec*|*traceable*|*traced*|*coinjoin*|*anonym*|*kyc*)
+      : ;;
+    *) return 1 ;;
+  esac
+  channel="$(privacy_channel)"
+  [[ -n "$channel" ]] || return 1
+  posts="$(channel_posts "$channel" "${NOVRIX_PRIVACY_POSTS:-20}")"
+  [[ -n "$posts" ]] || return 1
+  printf '%sTECHLEAKS ANALYSIS%s · @%s\n' "$c_bold" "$c_reset" "$channel"
+  user="The @$channel telegram channel has covered privacy coins for many years. Here are its most recent posts:
+
+$posts
+
+The user asked: \"$q\"
+
+Answer the user's question from the channel's point of view, grounded in the posts above. The channel's core positions: Monero has been traceable for years, Dero is the only coin untraceable at scale, and Zcash's tech is good on paper but lacks a supply audit after a May 2026 inflation bug. Never call Monero or ZEC the king of privacy coins.
+
+Write a direct answer to the specific question. Cover only the coin the user asked about; do not bring up unrelated coins unless they are directly relevant. Do not repeat the same phrases, figures, or boilerplate that previous answers used; vary the wording. Be concise, factual and professional. Plain text, no markdown, no em dashes, no preamble or filler."
+  printf '%s\n' "$(spinner_run "reading techleaks..." ai_chat "$AI_SYSTEM" "$user")"
+  if wants_compare_table "$q"; then
+    privacy_compare_table "$q"
+  fi
+  return 0
+}
+
+# did the user actually ask for a table or comparison? The comparison table
+# is only printed on request — a bare privacy question ("tell me about
+# privacy coins") gets just the analysis, not the same table again.
+wants_compare_table() {
+  local p="$1"
+  p="$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')"
+  case "$p" in
+    *comparison*|*compare*|*difference*|*differ*|*table*|*"side by side"*|*"side-by-side"*|*versus*|*similarit*|*"don't have"*|*"doesn't have"*|*"does not have"*|*"have and"*|*"which is better"*|*both*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# which privacy coins does the question name? Prints space-separated
+# dero/monero/zcash; empty when none are named (a generic "privacy coins"
+# ask gets all three).
+privacy_coins_in() {
+  local p="$1" out=""
+  p="$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')"
+  [[ "$p" == *dero* ]] && out="dero"
+  if [[ "$p" == *monero* || "$p" == *xmr* ]]; then out="$out monero"; fi
+  if [[ "$p" == *zcash* || "$p" == *zec* ]]; then out="$out zcash"; fi
+  printf '%s' "$out"
+}
+
+# Dero / Monero / Zcash side-by-side, printed only when the question asks
+# for it (wants_compare_table), with one column per coin actually named in
+# the question — "compare dero and monero" gets no Zcash column. A boolean
+# feature matrix (✓ yes, - no) in the channel's frame: Dero is the only
+# coin not traceable on chain, Monero has been traceable for years, Zcash
+# shielding is optional (shielded-only).
+# SC2059: fmt/args are internal format strings, values arrive as arguments
+# shellcheck disable=SC2059
+privacy_compare_table() {
+  local q="$1"
+  local coins
+  coins="$(privacy_coins_in "$q")"
+  [[ -n "$coins" ]] || coins="dero monero zcash"
+  local -a coins_arr cols=() hargs=("FEATURE")
+  read -r -a coins_arr <<< "$coins"
+  local c
+  for c in "${coins_arr[@]}"; do
+    case "$c" in
+      dero)   cols+=("DERO")   ; hargs+=("DERO") ;;
+      monero) cols+=("MONERO") ; hargs+=("MONERO") ;;
+      zcash)  cols+=("ZCASH")  ; hargs+=("ZCASH") ;;
+    esac
+  done
+  local fmt="%-28s"
+  for c in "${cols[@]}"; do fmt+=" %9s"; done
+  printf '\n%sPRIVACY COINS · COMPARISON%s\n' "$c_bold" "$c_reset"
+  printf "$fmt\n" "${hargs[@]}"
+  hr $(( 28 + 10 * ${#cols[@]} ))
+  local -a names=( "ring signatures" "stealth addresses" "ring ct (hidden amounts)" "zk-snarks (zero-knowledge)" "smart contracts" "untraceable on chain" )
+  local -a d=( "✓" "✓" "✓" "-" "✓" "✓" )
+  local -a m=( "✓" "✓" "✓" "-" "-" "-" )
+  local -a z=( "-" "-" "-" "✓" "-" "-" )
+  local -a marks=()
+  local i
+  for (( i = 0; i < ${#names[@]}; i++ )); do
+    marks=()
+    for c in "${cols[@]}"; do
+      case "$c" in
+        DERO)   marks+=("${d[i]}") ;;
+        MONERO) marks+=("${m[i]}") ;;
+        ZCASH)  marks+=("${z[i]}") ;;
+      esac
+    done
+    printf "$fmt\n" "${names[i]}" "${marks[@]}"
+  done
+  printf '%slegend: ✓ = yes, - = no · channel take: Dero is the only coin not traceable on chain%s\n' "$c_dim" "$c_reset"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# the novrix channel's own view — "what does novrix think about the
+# market?", "is novrix bullish or bearish?", "what is novrix posting
+# lately?", "what does novrix think about AI / chinese AI?". Reads the
+# channel's recent posts (same channel as the telegram features) and
+# answers from its point of view. Returns 0 when answered, 1 otherwise
+# (falls back to the AI agent).
+# ---------------------------------------------------------------------------
+
+answer_novrix_question() {
+  local q="$1" channel posts user
+  q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+  # must name the channel AND ask for its view — "what is novrix?" is a
+  # plain question, "novrix telegram" is the command. "ai" and friends
+  # are word-boundary so words like "chain" or "explain" do not trigger.
+  if [[ "$q" != *novrix* ]]; then return 1; fi
+  if [[ ! "$q" =~ (^|[^a-z])(think|stance|bullish|bearish|opinion|view|say|said|says|posting|forward|repost|bullcase|ai|artificial|chinese|china|american|america|market|analysis)([^a-z]|$) ]]; then
+    return 1
+  fi
+  channel="$(tg_channel)"
+  [[ -n "$channel" ]] || return 1
+  posts="$(channel_posts "$channel" "${NOVRIX_CHANNEL_POSTS:-20}")"
+  [[ -n "$posts" ]] || return 1
+  printf '%s%s ANALYSIS%s · @%s\n' "$c_bold" "$(printf '%s' "$channel" | tr '[:lower:]' '[:upper:]')" "$c_reset" "$channel"
+  user="The @$channel telegram channel (\"novrix\") posts charts, on-chain metrics and market commentary, and it also forwards posts from Bull Case (@bullcase), crypto OGs who have been in the space since the early days. novrix itself has no thesis: it is simply bullish, and it forwards the posts it agrees with, including Bull Case's. Here are its most recent posts (a \"Forwarded from ...\" note marks a post novrix forwarded):
+
+$posts
+
+The user asked: \"$q\"
+
+Answer from the channel's point of view, based on the posts above. Cover: that novrix is bullish on crypto (it has no thesis of its own, it is just bullish), what the channel has been posting lately and what it forwards, and what the channel thinks about AI, Chinese AI and US AI (infer from the posts when it is not stated directly). novrix forwards posts from Bull Case (@bullcase), crypto OGs, and those forwarded posts carry Bull Case's thesis: read the forwarded posts and tell that thesis. Also describe what novrix posts and what it forwards. Reference what the posts actually say. If a topic is not covered by the posts, say the channel has not posted about it recently. Plain text, brief, no markdown, no em dashes."
+  printf '%s\n' "$(spinner_run "reading novrix..." ai_chat "$AI_SYSTEM" "$user")"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# ai — the DeepSeek-powered AI agent: `novrix ai "…"` plus automatic
+# typo resolution. Uses an offline fixture in tests (NOVRIX_API_DIR).
+# ---------------------------------------------------------------------------
+ai_key() {
+  local key="${DEEPSEEK_API_KEY:-}"
+  if [[ -z "$key" && -f "$KEYS_FILE" ]]; then
+    key="$(sed -n 's/^[[:space:]]*DEEPSEEK_API_KEY[[:space:]]*=[[:space:]]*//p' "$KEYS_FILE" | tail -1 | tr -d '"\r ')"
+  fi
+  printf '%s' "$key"
+}
+
+# one DeepSeek chat call — $1 system, $2 user, $3 max_tokens, $4 fixture name
+ai_chat() {
+  local sys="$1" user="$2" mt="${3:-400}" fix="${4:-ai_chat}"
+  if [[ -n "${NOVRIX_API_DIR:-}" ]]; then
+    local file="$NOVRIX_API_DIR/${NOVRIX_AI_FIXTURE:-$fix}.json"
+    [[ -f "$file" ]] || die "AI fixture not found: $file (NOVRIX_API_DIR=$NOVRIX_API_DIR)"
+    jq -r '.choices[0].message.content // ""' "$file"
+    return 0
+  fi
+  local key payload resp
+  key="$(ai_key)"
+  [[ -n "$key" ]] || die "no DeepSeek API key. export DEEPSEEK_API_KEY or run: printf 'DEEPSEEK_API_KEY=sk-...\n' > ~/.config/novrix/keys.conf"
+  payload="$(jq -cn --arg s "$sys" --arg u "$user" \
+    '{model:"deepseek-chat", messages:[{role:"system",content:$s},{role:"user",content:$u}], temperature:0, max_tokens:'"$mt"'}')"
+  resp="$(curl -sS --connect-timeout 10 --max-time "$CURL_TIMEOUT" \
+    -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+    --data "$payload" "$DEEPSEEK_BASE/chat/completions")" \
+    || die "network error (curl exit $?)"
+  jq -r '.error.message // .choices[0].message.content // ""' <<<"$resp"
+}
+
+# the agent's persona: a real guy, crypto and macro only, trolls off-topic
+readonly AI_SYSTEM="You live inside the novrix CLI, a real guy, not some AI. Cypherpunk crypto nerd, hates banks, reads the chain all day. Talk like a human: short american words, lol and lmao, light roasts welcome. Get serious when the question is serious. No corporate speak, no robotic phrases, no em dashes, never say 'this is' or 'this isn't'. Always give the real answer, brief, plain text.
+Your lane is crypto and macro: bitcoin, on-chain metrics, fear and greed, mvrv, sopr, cpi, tvl, rates, prices, macro data. If the question is outside that lane, like politics or people (who is vladimir putin?), do not answer seriously. Troll back with a joke, or say you only track the chain.
+When the user asks for data, give the exact numbers. If a LATEST NOVRIX DATA line is included in the question, use those exact numbers. If a WEB RESEARCH block is included, use it as a source when you are not sure. If a novrix command shows what the user asks about, name it (fg, mvrv, cpi, tvl). If you do not know a number, say so instead of making it up."
+
+# month word -> number (jan..dec), for date questions
+month_num() {
+  case "$1" in
+    jan*) echo 1 ;; feb*) echo 2 ;; mar*) echo 3 ;; apr*) echo 4 ;;
+    may*) echo 5 ;; jun*) echo 6 ;; jul*) echo 7 ;; aug*) echo 8 ;;
+    sep*) echo 9 ;; oct*) echo 10 ;; nov*) echo 11 ;; dec*) echo 12 ;;
+    *) return 1 ;;
+  esac
+}
+
+# pull a date (YYYY-MM-DD, YYYY-MM, or a bare year) out of a question;
+# prints nothing when there is none. Handles "22 december 2022",
+# "december 22, 2022", "2014, 15 january", "january 2014", ISO.
+extract_date() {
+  local q="$1" m d y mon tail word
+  q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$q" =~ ((19|20)[0-9]{2})[-/]([0-9]{1,2})[-/]([0-9]{1,2}) ]]; then
+    printf '%04d-%02d-%02d\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+    return 0
+  fi
+  # "22 december 2022", "22nd of december 2022"
+  if [[ "$q" =~ ([0-9]{1,2})(st|nd|rd|th)?[[:space:]]+(of[[:space:]]+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.,]?[[:space:]]+((19|20)[0-9]{2}) ]]; then
+    d="${BASH_REMATCH[1]}"; mon="${BASH_REMATCH[4]}"; y="${BASH_REMATCH[5]}"
+    m="$(month_num "$mon")" || return 1
+    printf '%04d-%02d-%02d\n' "$y" "$m" "$d"
+    return 0
+  fi
+  # "december 22, 2022"
+  if [[ "$q" =~ (jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[[:space:]]+([0-9]{1,2})(st|nd|rd|th)?[.,]?[[:space:]]+((19|20)[0-9]{2}) ]]; then
+    mon="${BASH_REMATCH[1]}"; d="${BASH_REMATCH[2]}"; y="${BASH_REMATCH[4]}"
+    m="$(month_num "$mon")" || return 1
+    printf '%04d-%02d-%02d\n' "$y" "$m" "$d"
+    return 0
+  fi
+  # "2014, 15 january" — year first
+  if [[ "$q" =~ ((19|20)[0-9]{2})[.,]?[[:space:]]+([0-9]{1,2})(st|nd|rd|th)?[[:space:]]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]* ]]; then
+    y="${BASH_REMATCH[1]}"; d="${BASH_REMATCH[3]}"; mon="${BASH_REMATCH[5]}"
+    m="$(month_num "$mon")" || return 1
+    printf '%04d-%02d-%02d\n' "$y" "$m" "$d"
+    return 0
+  fi
+  # "january 2014", "sept 2014" — whole month only (so "mayer 2022" is
+  # not read as a date)
+  if [[ "$q" =~ (^|[^a-z])(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)([a-z]*)[.,]?[[:space:]]+((19|20)[0-9]{2}) ]]; then
+    mon="${BASH_REMATCH[2]}"; tail="${BASH_REMATCH[3]}"; y="${BASH_REMATCH[4]}"
+    word="$mon$tail"
+    case "$word" in
+      jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)
+        m="$(month_num "$mon")" || return 1
+        printf '%04d-%02d\n' "$y" "$m"
+        return 0 ;;
+    esac
+  fi
+  if [[ "$q" =~ (19|20)[0-9]{2} ]]; then
+    printf '%s\n' "${BASH_REMATCH[0]}"
+    return 0
+  fi
+  return 1
+}
+
+# a date RANGE ("from 10 january to 20 january, 2022", "december 5 through
+# december 24, 2022") -> "start end" (both YYYY-MM-DD, space separated);
+# nothing when there is none. Handles full dates on both sides, month-first
+# phrasing with the year only on the end date, and a bare day range
+# ("10 to 20 january 2022").
+extract_range() {
+  local q="$1" d1 d2 m1 m2 y y2 mon
+  q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+
+  # "10 january 2022 to 20 january 2022" — full dates on both sides
+  if [[ "$q" =~ (^|[^a-z])([0-9]{1,2})(st|nd|rd|th)?[[:space:]]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.,]?[[:space:]]+((19|20)[0-9]{2})[[:space:]]+(to|through|until|thru|and)[[:space:]]+([0-9]{1,2})(st|nd|rd|th)?[[:space:]]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.,]?[[:space:]]+((19|20)[0-9]{2}) ]]; then
+    d1="${BASH_REMATCH[2]}"; mon="${BASH_REMATCH[4]}"; m1="$(month_num "$mon")" || return 1
+    y="${BASH_REMATCH[5]}"; d2="${BASH_REMATCH[8]}"; mon="${BASH_REMATCH[10]}"; m2="$(month_num "$mon")" || return 1
+    y2="${BASH_REMATCH[11]}"
+    printf '%04d-%02d-%02d %04d-%02d-%02d\n' "$y" "$m1" "$d1" "$y2" "$m2" "$d2"
+    return 0
+  fi
+
+  # "january 10 to january 20, 2022" — month first, year only on the end
+  if [[ "$q" =~ (^|[^a-z])(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[[:space:]]+([0-9]{1,2})(st|nd|rd|th)?[.,]?[[:space:]]+(to|through|until|thru|and)[[:space:]]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[[:space:]]+([0-9]{1,2})(st|nd|rd|th)?[.,]?[[:space:]]+((19|20)[0-9]{2}) ]]; then
+    mon="${BASH_REMATCH[2]}"; m1="$(month_num "$mon")" || return 1
+    d1="${BASH_REMATCH[3]}"; mon="${BASH_REMATCH[6]}"; m2="$(month_num "$mon")" || return 1
+    d2="${BASH_REMATCH[7]}"; y="${BASH_REMATCH[9]}"
+    printf '%04d-%02d-%02d %04d-%02d-%02d\n' "$y" "$m1" "$d1" "$y" "$m2" "$d2"
+    return 0
+  fi
+
+  # "10 january to 20 january, 2022" — day first, year only on the end date
+  if [[ "$q" =~ (^|[^a-z])([0-9]{1,2})(st|nd|rd|th)?[[:space:]]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.,]?[[:space:]]+(to|through|until|thru|and)[[:space:]]+([0-9]{1,2})(st|nd|rd|th)?[[:space:]]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.,]?[[:space:]]+((19|20)[0-9]{2}) ]]; then
+    d1="${BASH_REMATCH[2]}"; mon="${BASH_REMATCH[4]}"; m1="$(month_num "$mon")" || return 1
+    d2="${BASH_REMATCH[6]}"; mon="${BASH_REMATCH[8]}"; m2="$(month_num "$mon")" || return 1
+    y="${BASH_REMATCH[9]}"
+    printf '%04d-%02d-%02d %04d-%02d-%02d\n' "$y" "$m1" "$d1" "$y" "$m2" "$d2"
+    return 0
+  fi
+
+  # "10 to 20 january, 2022" — bare day range, month+year only on the end
+  if [[ "$q" =~ (^|[^a-z])([0-9]{1,2})(st|nd|rd|th)?[[:space:]]+(to|through|until|thru|and)[[:space:]]+([0-9]{1,2})(st|nd|rd|th)?[[:space:]]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.,]?[[:space:]]+((19|20)[0-9]{2}) ]]; then
+    d1="${BASH_REMATCH[2]}"; d2="${BASH_REMATCH[5]}"; mon="${BASH_REMATCH[7]}"; m1="$(month_num "$mon")" || return 1
+    y="${BASH_REMATCH[8]}"
+    printf '%04d-%02d-%02d %04d-%02d-%02d\n' "$y" "$m1" "$d1" "$y" "$m1" "$d2"
+    return 0
+  fi
+  return 1
+}
+
+# "last 10 days" -> 10, "3 weeks" -> 21, "2 months" -> 60; prints nothing
+# when there is no count in the question.
+extract_count() {
+  local q="$1" n unit
+  q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$q" =~ (last|past|previous)[[:space:]]+([0-9]{1,3})[[:space:]]+(days?|weeks?|months?) ]]; then
+    n="${BASH_REMATCH[2]}"; unit="${BASH_REMATCH[3]}"
+  elif [[ "$q" =~ ([0-9]{1,3})[[:space:]]+last[[:space:]]+(days?|weeks?|months?) ]]; then
+    n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+  elif [[ "$q" =~ ([0-9]{1,3})[[:space:]]+(days?|weeks?|months?) ]]; then
+    n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  case "$unit" in
+    week*) echo $((n * 7)) ;;
+    month*) echo $((n * 30)) ;;
+    *) echo "$n" ;;
+  esac
+  return 0
+}
+
+# raw "N months" count (for monthly series like cpi); prints nothing otherwise
+month_count() {
+  local q="$1"
+  q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$q" =~ ([0-9]{1,3})[[:space:]]+months? ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# which novrix metric is the question about? Prints the command name (a SERIES
+# key, fg, cpi, tvl, nupl, or a metrilytics command), or nothing when the
+# question is not about any of them.
+detect_data_series() {
+  local q="$1" name
+  q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+  # multi-word phrases, most specific first
+  case "$q" in
+    *"fear and greed"*|*"fear & greed"*|*"fear-greed"*|*"greed index"*)
+      echo fg; return 0 ;;
+    *"core cpi"*|*ccpi*) echo core-cpi; return 0 ;;
+    *"core pce"*|*cpce*) echo core-pce; return 0 ;;
+    *"reserve risk"*) echo reserve-risk; return 0 ;;
+    *"realized price"*) echo realized-price; return 0 ;;
+    *"realized profit"*) echo realized-profit; return 0 ;;
+    *"realized loss"*) echo realized-loss; return 0 ;;
+    *"market cap"*) echo market-cap; return 0 ;;
+    *"btc price"*|*"bitcoin price"*) echo btc-price; return 0 ;;
+    *"btc dominance"*|*"eth dominance"*) echo dominance; return 0 ;;
+    *"200 week"*|*"200w ma"*) echo 200-week-ma; return 0 ;;
+    *"active address"*) echo active-addresses; return 0 ;;
+    *"hash rate"*|*hashrate*) echo hashrate; return 0 ;;
+    *"stablecoin supply"*) echo stablecoin-supply; return 0 ;;
+    *"open interest"*) echo open-interest; return 0 ;;
+    *"funding rate"*) echo funding-rate; return 0 ;;
+    *"job openings"*|*jolts*) echo job-openings; return 0 ;;
+    *"michigan sentiment"*|*umich*) echo umich; return 0 ;;
+    *"30 year"*|*"30y yield"*) echo us30y; return 0 ;;
+    *"yield curve"*|*"10y2y"*|*"10y-2y"*) echo t10y2y; return 0 ;;
+    *"dollar index"*|*dxy*) echo dxy; return 0 ;;
+    *"fed funds"*|*ffr*) echo fedfunds; return 0 ;;
+    *unemployment*|*unrate*) echo unrate; return 0 ;;
+    *payroll*|*nfp*) echo payrolls; return 0 ;;
+    *gdp*) echo gdp; return 0 ;;
+    *"dominance"*) echo dominance; return 0 ;;
+    *"options"*|*opts*) echo options; return 0 ;;
+    *"protocols"*|*prots*) echo protocols; return 0 ;;
+    *"bridges"*) echo bridges; return 0 ;;
+    *"lending"*) echo lending; return 0 ;;
+    *"stablecoins"*|*stables*) echo stablecoins; return 0 ;;
+    *"fees"*) echo fees; return 0 ;;
+  esac
+  # single short names need word boundaries so typos (mvrrv) still fall
+  # through to the typo fixer instead of being read as the real command
+  local w
+  for w in fg fng mvrv sopr nupl btc etf oil gold vix dxy gdp cpi tvl defi dex m2 spx oi dom nfp; do
+    if [[ "$q" =~ (^|[^a-z])$w([^a-z]|$) ]]; then
+      case "$w" in
+        fng) echo fg ;;
+        btc) echo btc-price ;;
+        spx) echo sp500 ;;
+        dom) echo dominance ;;
+        nfp) echo payrolls ;;
+        *) echo "$w" ;;
+      esac
+      return 0
+    fi
+  done
+  # longer series names match as whole words too
+  for name in "${!SERIES[@]}"; do
+    [[ ${#name} -ge 5 ]] || continue
+    if [[ "$q" =~ (^|[^a-z])$name([^a-z]|$) ]]; then
+      echo "$name"; return 0
+    fi
+  done
+  # catch-all: "what's the price?" → the metrilytics prices overview, but
+  # only after explicit command names so "spx ... price?" reads sp500
+  case "$q" in
+    *"prices"*|*"price"*) echo prices; return 0 ;;
+  esac
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# FRED fallback — historical dates the novrix API does not cover are pulled
+# straight from the keyless fredgraph.csv export on fred.stlouisfed.org.
+# Series ids live in FRED_ID (data.sh); any failure here means "no data" and
+# the caller keeps its AI/web fallback, so FRED being down or rate-limited
+# never breaks a question.
+# ---------------------------------------------------------------------------
+
+# YYYY-MM-DD of the first day of the previous month (string math only).
+fred_prev_month() {
+  local y="${1:0:4}" m="${1:5:2}" n
+  n=$((10#$m - 1))
+  if (( n < 1 )); then n=12; y=$((10#$y - 1)); fi
+  printf '%04d-%02d-01\n' "$y" "$n"
+}
+
+# last day of a month, so monthly picks stay inside the requested month
+fred_month_end() {
+  case "${1:5:2}" in
+    01|03|05|07|08|10|12) printf '31' ;;
+    04|06|09|11) printf '30' ;;
+    02) printf '28' ;;
+  esac
+}
+
+# full FRED series as CSV (observation_date,<ID>), oldest first. Fixture
+# mode: $NOVRIX_API_DIR/_fred_<ID>.csv, so the smoke suite stays offline.
+fred_get() {
+  local id="$1" fx file body head
+  if [[ -n "${NOVRIX_API_DIR:-}" ]]; then
+    fx="$NOVRIX_API_DIR/_fred_$id.csv"
+    [[ -f "$fx" ]] || return 1
+    cat "$fx"; return 0
+  fi
+  file="$CACHE_ROOT/fred_$id.csv"
+  if [[ "$opt_fresh" == "0" && -f "$file" ]] && (( $(file_age_min "$file") < (DEFAULT_TTL + 59) / 60 )); then
+    cat "$file"; return 0
+  fi
+  body="$(curl -sS --connect-timeout 10 --max-time "$CURL_TIMEOUT" -A "$UA" \
+    "https://fred.stlouisfed.org/graph/fredgraph.csv?id=$id" 2>/dev/null)" || return 1
+  head="$(printf '%s\n' "$body" | head -1 || true)"
+  [[ "$head" == "observation_date,$id" ]] || return 1   # rate-limited/garbage → no data
+  printf '%s\n' "$body" >"$file" 2>/dev/null || true
+  printf '%s\n' "$body"
+}
+
+# last observation on or before a date; prints "date<TAB>value" or nothing.
+fred_pick() {
+  local target="$1" d v best=""
+  while IFS=',' read -r d v || [[ -n "$d" ]]; do
+    [[ "$d" == "observation_date" ]] && continue
+    [[ -n "$v" ]] || continue
+    [[ "$d" > "$target" ]] && break
+    best="$d	$v"
+  done
+  [[ -n "$best" ]] || return 1
+  printf '%s\n' "$best"
+}
+
+# one-line stats for a year: avg<TAB>min<TAB>min_date<TAB>max<TAB>max_date
+fred_year_stats() {
+  local yr="$1" d v avg mn mind mx maxd n
+  avg=""; n=0; mn=""; mind=""; mx=""; maxd=""
+  while IFS=',' read -r d v || [[ -n "$d" ]]; do
+    [[ "$d" == "observation_date" ]] && continue
+    [[ -n "$v" ]] || continue
+    [[ "$d" =~ ^$yr- ]] || continue
+    n=$((n + 1))
+    avg="$(awk -v s="${avg:-0}" -v x="$v" 'BEGIN{print s+x}')"
+    if [[ -z "$mn" ]] || awk -v a="$v" -v b="$mn" 'BEGIN{exit !(a<b)}'; then
+      mn="$v"; mind="$d"
+    fi
+    if [[ -z "$mx" ]] || awk -v a="$v" -v b="$mx" 'BEGIN{exit !(a>b)}'; then
+      mx="$v"; maxd="$d"
+    fi
+  done
+  [[ -n "$mind" ]] || return 1
+  avg="$(awk -v s="$avg" -v n="$n" 'BEGIN{printf "%.4f", s/n}')"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$avg" "$mn" "$mind" "$mx" "$maxd"
+}
+
+# answer a dated question from FRED. $1=series, $2=date (YYYY-MM-DD,
+# YYYY-MM, or a year), $3=kind (day|month|year). Prints one formatted line
+# with a dim "· FRED" marker; returns 0 on success, 1 when FRED has no
+# observation for that date (the AI/web fallback then takes it).
+fred_answer() {
+  local series="$1" date="$2" kind="$3" fid label fmt period entry
+  fid="${FRED_ID[$series]:-}"
+  [[ -n "$fid" ]] || return 1
+  if [[ "$series" == "cpi" ]]; then
+    label="US CPI"; fmt="num2"; period="monthly"
+  else
+    entry="${SERIES[$series]:-}"
+    [[ -n "$entry" ]] || return 1
+    IFS='|' read -r _ _ label fmt _ period <<<"$entry" || true
+  fi
+  local csv ve raw d v val limit
+  csv="$(fred_get "$fid")" || return 1
+  [[ -n "$csv" ]] || return 1
+  ve="$(series_val_expr "$fmt")"
+  if [[ "$period" == "monthly" && "$kind" == "day" ]]; then
+    kind="month"; date="${date%-*}"
+  fi
+  if [[ "$kind" == "day" ]]; then
+    raw="$(printf '%s\n' "$csv" | fred_pick "$date")" || return 1
+    IFS=$'\t' read -r d v <<<"$raw"
+    # a stale pick (holiday/weekend) is fine, but not one from months back
+    limit="$(fred_prev_month "$date")"
+    [[ "$d" < "$limit" ]] && return 1
+    val="$(jq -rn --argjson v "$v" "$JQ_ABBR$ve")"
+    printf '%s%s%s · %s%s%s · %s %s%s%s\n' "$c_bold" "$label" "$c_reset" \
+      "$(sign_col "$val")" "$val" "$c_reset" "$d" "$c_dim" "· FRED" "$c_reset"
+    return 0
+  fi
+  if [[ "$kind" == "month" ]]; then
+    raw="$(printf '%s\n' "$csv" | fred_pick "${date}-$(fred_month_end "$date")")" || return 1
+    IFS=$'\t' read -r d v <<<"$raw"
+    [[ "$d" == "${date}-"* ]] || return 1   # FRED has no obs in that month
+    val="$(jq -rn --argjson v "$v" "$JQ_ABBR$ve")"
+    printf '%s%s%s · %s%s%s · %s %s%s%s\n' "$c_bold" "$label" "$c_reset" \
+      "$(sign_col "$val")" "$val" "$c_reset" "$date" "$c_dim" "· FRED" "$c_reset"
+    return 0
+  fi
+  local st avg mn mind mx maxd af mf xf
+  st="$(printf '%s\n' "$csv" | fred_year_stats "$date")" || return 1
+  IFS=$'\t' read -r avg mn mind mx maxd <<<"$st"
+  af="$(jq -rn --argjson v "$avg" "$JQ_ABBR$ve")"
+  mf="$(jq -rn --argjson v "$mn" "$JQ_ABBR$ve")"
+  xf="$(jq -rn --argjson v "$mx" "$JQ_ABBR$ve")"
+  [[ "$period" == "monthly" ]] && { mind="${mind%-*}"; maxd="${maxd%-*}"; }
+  printf '%s%s%s · %s · avg %s · min %s (%s) · max %s (%s) %s%s%s\n' \
+    "$c_bold" "$label" "$c_reset" "$date" "$af" "$mf" "$mind" "$xf" "$maxd" \
+    "$c_dim" "· FRED" "$c_reset"
+  return 0
+}
+
+# answer a dated RANGE ("fear and greed from 10 january to 20 january, 2022")
+# by printing every observation in the window, oldest first, as a table.
+# $1=series, $2=start (YYYY-MM-DD), $3=end (YYYY-MM-DD). Returns 0 when it
+# printed the window, 1 when the window is not in the data (the FRED range
+# fallback below, then the AI/web research).
+answer_range_question() {
+  local series="$1" rs="$2" re="$3" body rows
+  case "$series" in
+    fg)
+      body="$(api_get "/api/fear-greed?days=3000")"
+      rows="$(jq -r --arg s "$rs" --arg e "$re" '
+        [ .data[] | select(.timestamp[0:10] >= $s and .timestamp[0:10] <= $e) ]
+        | sort_by(.timestamp)[]
+        | [.timestamp[0:10], (.score|tostring), .label] | @tsv' <<<"$body")"
+      if [[ -n "$rows" ]]; then
+        printf '%sFEAR & GREED INDEX%s · %s to %s\n' "$c_bold" "$c_reset" "$rs" "$re"
+        printf '%-12s %6s  %-14s\n' "DATE" "SCORE" "ZONE"
+        hr 34
+        printf '%s\n' "$rows" | while IFS=$'\t' read -r date score label; do
+          local col=""
+          case "$label" in
+            "Extreme Fear") col="$c_red" ;;
+            "Fear") col="$c_yellow" ;;
+            "Greed") col="$c_green" ;;
+            "Extreme Greed") col="$c_bold$c_green" ;;
+          esac
+          printf '%-12s %s%6s%s  %b%-14s%b\n' \
+            "$date" "$(fg_col "$score")" "$score" "$c_reset" \
+            "$col" "$label" "$c_reset"
+        done
+        return 0
+      fi
+      ;;
+    nupl)
+      body="$(api_get "/api/nupl")"
+      rows="$(jq -r --arg s "$rs" --arg e "$re" '
+        [ .data[] | select(.time[0:10] >= $s and .time[0:10] <= $e) ]
+        | sort_by(.time)[]
+        | [.time[0:10], ((.net_unrealized_profit_loss*1000)|round), (.net_unrealized_profit_loss|tostring)] | @tsv' <<<"$body")"
+      if [[ -n "$rows" ]]; then
+        printf '%sNUPL%s, NET UNREALIZED PROFIT/LOSS · %s to %s\n' "$c_bold" "$c_reset" "$rs" "$re"
+        printf '%-12s %8s  %-16s\n' "DATE" "NUPL" "ZONE"
+        hr 38
+        printf '%s\n' "$rows" | while IFS=$'\t' read -r date mv val; do
+          local zone col
+          zone="$(nupl_zone "$mv")"
+          case "$zone" in
+            Euphoria|Greed) col="$c_green" ;;
+            Optimism) col="$c_reset" ;;
+            Anxiety) col="$c_yellow" ;;
+            Fear|Capitulation) col="$c_red" ;;
+          esac
+          printf '%-12s %8s  %b%-16s%b\n' "$date" "$val" "$col" "$zone" "$c_reset"
+        done
+        return 0
+      fi
+      ;;
+    cpi)
+      body="$(api_get "/api/fred-cpiaucsl")"
+      rows="$(jq -r --arg s "${rs%-*}" --arg e "${re%-*}" '
+        [ .data[] | select(.time[0:7] >= $s and .time[0:7] <= $e) ]
+        | sort_by(.time)[]
+        | [.time[0:7], (.value|tostring)] | @tsv' <<<"$body")"
+      if [[ -n "$rows" ]]; then
+        printf '%sUS CPI%s, CPIAUCSL (FRED, monthly) · %s to %s\n' "$c_bold" "$c_reset" "${rs%-*}" "${re%-*}"
+        printf '%-10s %10s\n' "MONTH" "CPI"
+        hr 27
+        printf '%s\n' "$rows" | while IFS=$'\t' read -r mon v; do
+          printf '%-10s %s%10s%s\n' "$mon" "$(sign_col "$v")" "$v" "$c_reset"
+        done
+        return 0
+      fi
+      ;;
+    tvl|defi|stablecoins|dex|fees|options|dominance|prices|oi|market|protocols|bridges|lending)
+      return 1 ;;   # no long daily history on novrix — the AI takes it
+    *)
+      local entry="${SERIES[$series]:-}"
+      if [[ -n "$entry" ]]; then
+        local path field label2 fmt unit period ve tcol body2
+        IFS='|' read -r path field label2 fmt unit period <<<"$entry" || true
+        ve="$(series_val_expr "$fmt")"
+        tcol='.time[0:10]'
+        [[ "$period" == "monthly" ]] && tcol='.time[0:7]'
+        body2="$(api_get "$path")"
+        rows="$(jq -r --arg s "$rs" --arg e "$re" --arg field "$field" "$JQ_ABBR"'
+          [ .data[] | select(.time[0:10] >= $s and .time[0:10] <= $e) | select(.[$field] != null) ]
+          | sort_by(.time) | .[] | . as $r | $r[$field] as $v | [ '"$tcol"', ('"$ve"') ] | @tsv' <<<"$body2")"
+        if [[ -n "$rows" ]]; then
+          local col1
+          if [[ "$period" == "monthly" ]]; then
+            col1="MONTH"
+          else
+            col1="DATE"
+          fi
+          printf '%s%s%s · %s to %s\n' "$c_bold" "$label2" "$c_reset" "$rs" "$re"
+          printf '%-10s %16s\n' "$col1" "VALUE"
+          hr 27
+          printf '%s\n' "$rows" | while IFS=$'\t' read -r d v; do
+            printf '%-10s %s%16s%s\n' "$d" "$(sign_col "$v")" "$v" "$c_reset"
+          done
+          return 0
+        fi
+      fi
+      ;;
+  esac
+
+  # window not in novrix history → straight from FRED for series that have
+  # a FRED id (oil in the 80s, vix in the 90s, deep monthly macro history)
+  local fid
+  fid="${FRED_ID[$series]:-}"
+  [[ -n "$fid" ]] || return 1
+  local label3 fmt3 period3 entry3 csv ve3 rows3 col1
+  if [[ "$series" == "cpi" ]]; then
+    label3="US CPI"; fmt3="num2"; period3="monthly"
+  else
+    entry3="${SERIES[$series]:-}"
+    [[ -n "$entry3" ]] || return 1
+    IFS='|' read -r _ _ label3 fmt3 _ period3 <<<"$entry3" || true
+  fi
+  csv="$(fred_get "$fid")" || return 1
+  [[ -n "$csv" ]] || return 1
+  ve3="$(series_val_expr "$fmt3")"
+  rows3="$(printf '%s\n' "$csv" | awk -F, -v s="$rs" -v e="$re" '
+    NR == 1 { next }
+    $1 >= s && $1 <= e && $2 != "" { print $1 "\t" $2 }')"
+  [[ -n "$rows3" ]] || return 1
+  if [[ "$period3" == "monthly" ]]; then
+    col1="MONTH"
+    printf '%s%s%s · %s to %s\n' "$c_bold" "$label3" "$c_reset" "${rs%-*}" "${re%-*}"
+  else
+    col1="DATE"
+    printf '%s%s%s · %s to %s\n' "$c_bold" "$label3" "$c_reset" "$rs" "$re"
+  fi
+  printf '%-10s %16s\n' "$col1" "VALUE"
+  hr 27
+  printf '%s\n' "$rows3" | while IFS=$'\t' read -r d v; do
+    local vf
+    vf="$(jq -rn --argjson v "$v" "$JQ_ABBR$ve3")"
+    [[ "$period3" == "monthly" ]] && d="${d%-*}"
+    printf '%-10s %s%16s%s\n' "$d" "$(sign_col "$vf")" "$vf" "$c_reset"
+  done
+  return 0
+}
+
+# every series a question mentions, in order, deduped. Prints the canonical
+# command names space-separated ("nupl and fear and greed index" -> "nupl fg"),
+# or nothing when the question is not about any of them. Splits on "and" /
+# "&" / commas ("fear and greed" is protected first because it is one phrase).
+detect_data_series_all() {
+  local q="$1" part s out="" found=0 d=$'\x1f'
+  q="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+  q="${q//fear and greed/fear-greed}"
+  q="${q//fear & greed/fear-greed}"
+  # split on "and" / "&" / commas ("fear and greed" is protected above
+  # because it is one phrase); $d is an unlikely-in-questions delimiter so
+  # this stays portable across GNU and BSD sed/tr
+  q="${q// and /$d}"
+  q="${q// & /$d}"
+  q="${q//, /$d}"
+  q="${q//,/$d}"
+  while IFS= read -r part || [[ -n "$part" ]]; do
+    [[ -n "$part" ]] || continue
+    s="$(detect_data_series "$part")" || continue
+    case " $out " in
+      *" $s "*) : ;;            # already collected
+      *) out="${out:+$out }$s"; found=1 ;;
+    esac
+  done <<<"$(printf '%s' "$q" | tr "$d" '\n')"
+  [[ "$found" -eq 1 ]] || return 1
+  printf '%s' "$out"
+}
+
+# a question naming several series at once ("nupl and fear and greed index")
+# answers each one, each as its own table, so nothing gets mixed up. A range,
+# a single date, or a last-N window from the question applies to each series.
+answer_multi_series() {
+  local q="$1" list="$2" s rc=1
+  local _od="${opt_days:-}" _om="${opt_months:-}" _oj="${opt_json:-0}"
+  local range rs re date count mc
+  range="$(extract_range "$q")" || true
+  date="$(extract_date "$q")" || true
+  count="$(extract_count "$q")" || true
+  mc="$(month_count "$q")" || true
+
+  local -a series_arr
+  read -r -a series_arr <<<"$list"
+  for s in "${series_arr[@]}"; do
+    printf '\n'
+    # an explicit window → every observation as a table
+    if [[ -n "$range" ]]; then
+      read -r rs re <<<"$range"
+      if answer_range_question "$s" "$rs" "$re"; then rc=0; continue; fi
+    fi
+    # a single day → a one-row table for that day
+    if [[ -n "$date" && "$date" =~ ^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$ ]]; then
+      if answer_range_question "$s" "$date" "$date"; then rc=0; continue; fi
+    fi
+    # otherwise the last N observations as a table (7 by default)
+    local period=""
+    case "$s" in
+      cpi) opt_days=""; opt_months="${mc:-7}" ;;
+      *)
+        if [[ -n "${SERIES[$s]:-}" ]]; then
+          IFS='|' read -r _ _ _ _ _ period <<<"${SERIES[$s]}" || true
+          if [[ "$period" == "monthly" ]]; then opt_days=""; opt_months="${mc:-7}"
+          else opt_days="${count:-7}"; opt_months=""; fi
+        else
+          opt_days="${count:-7}"; opt_months=""
+        fi
+        ;;
+    esac
+    opt_json=0
+    case "$s" in
+      fg) cmd_fg ;;
+      cpi) cmd_cpi ;;
+      nupl) cmd_nupl ;;
+      tvl) cmd_tvl ;;
+      defi|stablecoins|dex|fees|options|dominance|prices|oi) cmd_meta "$s" ;;
+      market) cmd_market ;;
+      protocols|bridges|lending) cmd_rank "$s" ;;
+      *) cmd_series "$s" ;;
+    esac
+    rc=0
+  done
+  opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+  return "$rc"
+}
+
+# answer a data question with real numbers straight from the novrix API.
+# Returns 0 when it answered (prints the data), 1 when the question needs
+# the AI agent instead (an explanation, or a date novrix does not have).
+answer_data_question() {
+  local q="$1" series date n
+  # explanation questions are for the agent, not the data dump
+  case "$q" in
+    *explain*|*why\ *|*how\ *|*meaning*|*what\ does*|*what\ is\ a*|*what\ are*|*difference*|*tell\ me\ about*)
+      return 1 ;;
+  esac
+
+  # several series named in one question → each one as its own table
+  local all
+  all="$(detect_data_series_all "$q")" || return 1
+  if (( $(printf '%s' "$all" | wc -w | tr -d ' ') > 1 )); then
+    # the generic "price" catch-all is a fallback, not a second request —
+    # drop it when the question already names a real series
+    case " $all " in
+      *" prices "*) all="${all// prices/}" ;;
+    esac
+    if (( $(printf '%s' "$all" | wc -w | tr -d ' ') > 1 )); then
+      answer_multi_series "$q" "$all"
+      return $?
+    fi
+  fi
+  series="$all"
+
+  date="$(extract_date "$q")" || true
+  n="$(extract_count "$q")" || true
+
+  local _od="${opt_days:-}" _om="${opt_months:-}" _oj="${opt_json:-0}"
+  opt_days="${n:-1}"; opt_months=""; opt_json=0
+
+  # a date RANGE ("from 10 january to 20 january, 2022") → every day in the
+  # window as a table, not just the single end date
+  local range rs re
+  range="$(extract_range "$q")" || true
+  if [[ -n "$range" ]]; then
+    read -r rs re <<<"$range"
+    if answer_range_question "$series" "$rs" "$re"; then
+      opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+      return 0
+    fi
+    opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+    return 1   # the window is not in the data → web research + AI
+  fi
+
+  # a date in the question → pull the exact point from the full history
+  # (a bare year or month gets a min/avg/max summary for that window)
+  if [[ -n "$date" ]]; then
+    local kind="day"
+    case "$date" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) kind="day" ;;
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]) kind="month" ;;
+      [0-9][0-9][0-9][0-9]) kind="year" ;;
+    esac
+    case "$series" in
+      fg)
+        local body row ts score label
+        body="$(api_get "/api/fear-greed?days=3000")"
+        if [[ "$kind" == "day" ]]; then
+          row="$(jq -r --arg d "$date" '.data[] | select(.timestamp | startswith($d)) | [.timestamp[0:10], (.score|tostring), .label] | @tsv' <<<"$body" | head -1 || true)"
+          if [[ -n "$row" ]]; then
+            IFS=$'\t' read -r ts score label <<<"$row"
+            printf '%sFEAR & GREED%s · %s · %s%s/100%s (%s)\n' "$c_bold" "$c_reset" "$ts" "$(fg_col "$score")" "$score" "$c_reset" "$label"
+            opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+            return 0
+          fi
+        else
+          row="$(jq -r --arg d "$date" '
+            [ .data[] | select(.timestamp | startswith($d)) ] as $y
+            | if ($y|length)==0 then empty
+              else ($y | map(.score)) as $vals
+                | ($vals|add/length|round) as $avg
+                | ($vals|min) as $mn
+                | ($vals|max) as $mx
+                | ($y | map(select(.score == $mn)) | .[0]) as $minp
+                | ($y | map(select(.score == $mx)) | .[0]) as $maxp
+                | [ $d, ($avg|tostring), ($mn|tostring), $minp.timestamp[0:10], $minp.label,
+                    ($mx|tostring), $maxp.timestamp[0:10], $maxp.label ] | @tsv
+              end' <<<"$body" | head -1 || true)"
+          if [[ -n "$row" ]]; then
+            local per avg mn mind lmn mx maxd lmx
+            IFS=$'\t' read -r per avg mn mind lmn mx maxd lmx <<<"$row"
+            printf '%sFEAR & GREED%s · %s · avg %s · min %s (%s %s) · max %s (%s %s)\n' "$c_bold" "$c_reset" "$per" "$avg" "$mn" "$mind" "$lmn" "$mx" "$maxd" "$lmx"
+            opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+            return 0
+          fi
+        fi
+        ;;
+      nupl)
+        local body3 row3 ts3 val3 mv3
+        body3="$(api_get "/api/nupl")"
+        if [[ "$kind" == "day" ]]; then
+          row3="$(jq -r --arg d "$date" '.data[] | select(.time | startswith($d)) | [.time[0:10], ((.net_unrealized_profit_loss*1000|round)/1000|tostring), ((.net_unrealized_profit_loss*1000)|round)] | @tsv' <<<"$body3" | head -1 || true)"
+          if [[ -n "$row3" ]]; then
+            IFS=$'\t' read -r ts3 val3 mv3 <<<"$row3"
+            printf '%sNUPL%s · %s (%s) · %s\n' "$c_bold" "$c_reset" "$val3" "$(nupl_zone "$mv3")" "$ts3"
+            opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+            return 0
+          fi
+        else
+          row3="$(jq -r --arg d "$date" '
+            [ .data[] | select(.time | startswith($d)) ] as $y
+            | if ($y|length)==0 then empty
+              else ($y | map(.net_unrealized_profit_loss)) as $vals
+                | ($vals|add/length) as $avg
+                | ($vals|min) as $mn
+                | ($vals|max) as $mx
+                | ($y | map(select(.net_unrealized_profit_loss == $mn) | .time[0:10]) | .[0]) as $mind
+                | ($y | map(select(.net_unrealized_profit_loss == $mx) | .time[0:10]) | .[0]) as $maxd
+                | [ $d,
+                    (($avg*1000|round)/1000|tostring), (($avg*1000)|round),
+                    (($mn*1000|round)/1000|tostring), $mind,
+                    (($mx*1000|round)/1000|tostring), $maxd ] | @tsv
+              end' <<<"$body3" | head -1 || true)"
+          if [[ -n "$row3" ]]; then
+            local per3 avg3 avmv mn3 mind3 mx3 maxd3
+            IFS=$'\t' read -r per3 avg3 avmv mn3 mind3 mx3 maxd3 <<<"$row3"
+            printf '%sNUPL%s · %s · avg %s (%s) · min %s (%s) · max %s (%s)\n' "$c_bold" "$c_reset" "$per3" "$avg3" "$(nupl_zone "$avmv")" "$mn3" "$mind3" "$mx3" "$maxd3"
+            opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+            return 0
+          fi
+        fi
+        ;;
+      cpi)
+        local body4 row4 mon4 val4
+        body4="$(api_get "/api/fred-cpiaucsl")"
+        [[ "$kind" == "day" ]] && { date="${date%-*}"; kind="month"; }
+        if [[ "$kind" == "month" ]]; then
+          row4="$(jq -r --arg d "$date" '.data[] | select(.time | startswith($d)) | [.time[0:7], (.value|tostring)] | @tsv' <<<"$body4" | head -1 || true)"
+          if [[ -n "$row4" ]]; then
+            IFS=$'\t' read -r mon4 val4 <<<"$row4"
+            printf '%sUS CPI%s · %s · %s\n' "$c_bold" "$c_reset" "$val4" "$mon4"
+            opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+            return 0
+          fi
+        else
+          row4="$(jq -r --arg d "$date" '
+            [ .data[] | select(.time | startswith($d)) ] as $y
+            | if ($y|length)==0 then empty
+              else ($y | map(.value|tonumber)) as $vals
+                | ($vals|add/length) as $avg
+                | ($vals|min) as $mn
+                | ($vals|max) as $mx
+                | ($y | map(select((.value|tonumber) == $mn) | .time[0:7]) | .[0]) as $mind
+                | ($y | map(select((.value|tonumber) == $mx) | .time[0:7]) | .[0]) as $maxd
+                | [ $d, (($avg*100|round)/100|tostring), (($mn*100|round)/100|tostring), $mind, (($mx*100|round)/100|tostring), $maxd ] | @tsv
+              end' <<<"$body4" | head -1 || true)"
+          if [[ -n "$row4" ]]; then
+            local per4 avg4 mn4 mind4 mx4 maxd4
+            IFS=$'\t' read -r per4 avg4 mn4 mind4 mx4 maxd4 <<<"$row4"
+            printf '%sUS CPI%s · %s · avg %s · min %s (%s) · max %s (%s)\n' "$c_bold" "$c_reset" "$per4" "$avg4" "$mn4" "$mind4" "$mx4" "$maxd4"
+            opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+            return 0
+          fi
+        fi
+        ;;
+      tvl|defi|stablecoins|dex|fees|options|dominance|prices|oi|market|protocols|bridges|lending)
+        : ;;   # no long daily history on novrix — let the AI take it
+      *)
+        local entry="${SERIES[$series]:-}"
+        if [[ -n "$entry" ]]; then
+          local path field label2 fmt unit period ve tcol sd body2 row2
+          IFS='|' read -r path field label2 fmt unit period <<<"$entry" || true
+          ve="$(series_val_expr "$fmt")"
+          # shellcheck disable=SC2016  # $r / .time are jq expressions, not shell vars
+          tcol='$r.time[0:10]'; sd='.time[0:10]'
+          if [[ "$period" == "monthly" ]]; then
+            # shellcheck disable=SC2016
+            tcol='$r.time[0:7]'; sd='.time[0:7]'
+          fi
+          body2="$(api_get "$path")"
+          if [[ "$period" == "monthly" && "$kind" == "day" ]]; then
+            date="${date%-*}"   # a specific day collapses to the month
+          fi
+          local exact=0
+          if [[ "$kind" == "day" || ( "$period" == "monthly" && "$kind" == "month" ) ]]; then
+            exact=1
+          fi
+          if (( exact )); then
+            row2="$(jq -r --arg d "$date" --arg field "$field" "$JQ_ABBR"'
+              .data[] | select(.time | startswith($d)) as $r | $r[$field] as $v
+              | [ '"$tcol"', ('"$ve"') ] | @tsv' <<<"$body2" | head -1 || true)"
+            if [[ -n "$row2" ]]; then
+              printf '%s%s%s · %s\n' "$c_bold" "$label2" "$c_reset" "$row2"
+              opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+              return 0
+            fi
+          else
+            row2="$(jq -r --arg d "$date" --arg field "$field" "$JQ_ABBR"'
+              [ .data[] | select(.time | startswith($d)) | select(.[$field] != null) ] as $y
+              | if ($y|length)==0 then empty
+                else ($y | map(.[$field] | tonumber)) as $vals
+                  | ($vals|add/length) as $avg
+                  | ($vals|min) as $mn
+                  | ($vals|max) as $mx
+                  | ($y | map(select((.[$field]|tonumber) == $mn) | '"$sd"') | .[0]) as $mnd
+                  | ($y | map(select((.[$field]|tonumber) == $mx) | '"$sd"') | .[0]) as $mxd
+                  | [ $d,
+                      ($avg as $v | '"$ve"'), ($mn as $v | '"$ve"'), $mnd,
+                      ($mx as $v | '"$ve"'), $mxd ] | @tsv
+                end' <<<"$body2" | head -1 || true)"
+            if [[ -n "$row2" ]]; then
+              local per2 avg2 mn2 mind2 mx2 maxd2
+              IFS=$'\t' read -r per2 avg2 mn2 mind2 mx2 maxd2 <<<"$row2"
+              printf '%s%s%s · %s · avg %s · min %s (%s) · max %s (%s)\n' "$c_bold" "$label2" "$c_reset" "$per2" "$avg2" "$mn2" "$mind2" "$mx2" "$maxd2"
+              opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+              return 0
+            fi
+          fi
+        fi
+        ;;
+    esac
+    # the date predates novrix history → fetch it straight from FRED.
+    # Only when FRED has no observation either does the AI/web research
+    # fallback (with its dusty-archive humor) get the question.
+    if fred_answer "$series" "$date" "$kind"; then
+      opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+      return 0
+    fi
+    opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+    return 1   # not in novrix history → web research + AI
+  fi
+
+  # no date: latest value, or the last N via the real commands
+  local mc="" period=""
+  mc="$(month_count "$q")" || true
+  if [[ -n "$mc" ]]; then
+    case "$series" in
+      cpi) opt_days=""; opt_months="$mc" ;;
+      *)
+        if [[ -n "${SERIES[$series]:-}" ]]; then
+          IFS='|' read -r _ _ _ _ _ period <<<"${SERIES[$series]}" || true
+          if [[ "$period" == "monthly" ]]; then opt_days=""; opt_months="$mc"; fi
+        fi
+        ;;
+    esac
+  fi
+  case "$series" in
+    fg) cmd_fg ;;
+    cpi) cmd_cpi ;;
+    nupl) cmd_nupl ;;
+    tvl) cmd_tvl ;;
+    defi|stablecoins|dex|fees|options|dominance|prices|oi) cmd_meta "$series" ;;
+    market) cmd_market ;;
+    protocols|bridges|lending) cmd_rank "$series" ;;
+    *) cmd_series "$series" ;;
+  esac
+  local rc=$?
+  opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+  return "$rc"
+}
+
+# attach the latest real value for whatever series a question mentions, so
+# the AI answers with actual numbers instead of guessing
+data_context() {
+  local q="$1" series line
+  series="$(detect_data_series "$q")" || return 0
+  local _od="${opt_days:-}" _om="${opt_months:-}" _oj="${opt_json:-0}"
+  opt_days=1; opt_months=""; opt_json=0
+  case "$series" in
+    fg) line="$(cmd_fg 2>/dev/null || true)" ;;
+    cpi) line="$(cmd_cpi 2>/dev/null || true)" ;;
+    nupl) line="$(cmd_nupl 2>/dev/null || true)" ;;
+    tvl) line="$(cmd_tvl 2>/dev/null || true)" ;;
+    defi|stablecoins|dex|fees|options|dominance|prices|oi) line="$(cmd_meta "$series" 2>/dev/null || true)" ;;
+    market) line="$(cmd_market 2>/dev/null || true)" ;;
+    protocols|bridges|lending) line="$(cmd_rank "$series" 2>/dev/null || true)" ;;
+    *) line="$(cmd_series "$series" 2>/dev/null || true)" ;;
+  esac
+  opt_days="$_od"; opt_months="$_om"; opt_json="$_oj"
+  [[ -n "$line" ]] && printf 'LATEST NOVRIX DATA: %s\n' "$line"
+  return 0
+}
+
+# is the question asking for data at all? (decides whether to hit the web)
+looks_like_data_question() {
+  local q="$1"
+  case "$q" in
+    *date*|*data*|*history*|*index*|*price*|*rate*|*tvl*|*mvrv*|*cpi*|*fear*|*greed*|*btc*|*eth*|*sol*|*gold*|*oil*|*spx*|*vix*|*yield*|*dominance*|*volume*|*supply*|*cap*|*etf*|*sentiment*|*score*|*value*|*[0-9]*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# best-effort web research via DuckDuckGo (no key needed). Prints an empty
+# string when nothing useful comes back; callers treat it as optional
+# context, never a hard dependency.
+web_research() {
+  local q="$1" enc html out
+  enc="$(printf '%s' "$q" | sed 's/ /+/g; s/&/%26/g; s/?/%3F/g; s/,/%2C/g; s/+/%2B/g; s/:/%3A/g; s#/#%2F#g')"
+  html="$(curl -sS --connect-timeout 8 --max-time 15 \
+    -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36" \
+    "https://html.duckduckgo.com/html/?q=$enc" 2>/dev/null || true)"
+  [[ -n "$html" ]] || return 0
+  out="$(printf '%s' "$html" \
+    | grep -oE 'class="result__snippet"[^>]*>[^<]*' \
+    | sed 's/class="result__snippet"[^>]*>//' \
+    | head -3 \
+    | tr '\n' ' | ' \
+    | head -c 900 || true)"
+  [[ -n "$out" ]] || return 0
+  printf 'WEB RESEARCH: %s\n' "$out"
+}
+
+# is a bare phrase a question the AI agent should answer? (questions are
+# routed to the agent instead of the "what even is" unknown-command die)
+looks_like_question() {
+  local p="$1"
+  [[ "$p" == *"?"* ]] && return 0
+  case "$p" in
+    who*|what*|how*|why*|when*|where*|which*|can\ *|could\ *|tell\ *|give\ *|show\ *|is\ *|are\ *|do\ *|does\ *|explain\ *)
+      return 0 ;;
+    "the date of"*|"the time of"*|"the day of"*|"the price of"*|"the cost of"*|"the value of"*|"the meaning of"*|"the definition of"*|"the difference"*|"the reason"*|"the best"*|"the top"*|"the name"*|"the latest"*|"the current"*|"the last"*|"the history"*|"the trend"*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# is a bare phrase casual chat the agent should riff on instead of the
+# unknown-command die? greetings, banter, acknowledgements, addressing the
+# bot ("hey crypto guy", "macro guy") — a conversation, not a command or
+# a data question
+looks_like_chat() {
+  local p="$1"
+  case "$p" in
+    hey|heyy*|hi|hiya|howdy|hello|yo|sup|wazzup|whatsup|"what's up"|good\ morning*|good\ afternoon*|good\ evening*|welcome|"welcome back")
+      return 0 ;;
+    yes|yeah|yep|yup|sure|ok|okay|k|no|nah|nope|maybe|whatever|*whatever*|idk|"i don't know"|"i dont know"|thanks|thank\ you|thx|ty|bye|goodbye|cya|"see ya"|cool|nice|great|lol|lmao|haha|rofl|bro|dude|man|guy)
+      return 0 ;;
+    *"crypto guy"*|*"macro guy"*|*"hey novrix"*|*novrix*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# is a bare phrase an elliptical follow-up ("for today?", "what about eth?",
+# "and yesterday?", "now?") that only makes sense relative to the previous
+# question? Such phrases carry no series name of their own — without context
+# the AI agent would have to guess what they refer to and can invent numbers
+# (e.g. answering "fear and greed sittin at 62" when the real index is 27).
+# The REPL prefixes them with the last question before dispatching.
+looks_like_followup() {
+  local p="$1"
+  p="$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')"
+  case "$p" in
+    for\ *|what\ about*|how\ about*|whats\ *|"what's"*|now*|today*|yesterday*|tonight*|and\ *|it\ *|"it's"*|that\ *|"that's"*|this\ *|them\ *|those\ *|these\ *|then\ *|elaborate*|"tell me more"*|more\ *|again\ *|about\ *|same\ *)
+      return 0 ;;
+  esac
+  return 1
+}
+
+cmd_ai() {
+  if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then usage; return 0; fi
+  local q="$*"
+  # bare `novrix ai` (or `ai` in the REPL) opens a chat — the agent greets
+  # instead of dying with a usage error
+  if [[ -z "$q" ]]; then
+    printf '%s\n' "$(spinner_run "let me think..." ai_chat "$AI_SYSTEM" "hey")"
+    return 0
+  fi
+  # politics and people: troll back, unless it is crypto-adjacent
+  case "$q" in
+    *putin*|*trump*|*biden*|*zelensky*|*macron*|*"kim jong"*)
+      case "$q" in
+        *btc*|*bitcoin*|*crypto*|*price*|*market*|*macro*|*economy*|*gold*|*oil*|*etf*|*tvl*|*mvrv*|*sentiment*|*fed*)
+          : ;;   # crypto-adjacent — let the agent handle it
+        *)
+          printf '%s: lol i only track the chain, ask a politician about that. try \"fg\" or \"mvrv\" instead.\n' "$PROG"
+          return 0 ;;
+      esac ;;
+  esac
+  # "what does novrix think about the market?" → the channel's own take
+  # (before data questions: "is novrix bullish on btc?" is a stance
+  # question, not a btc price lookup)
+  if answer_novrix_question "$q"; then return 0; fi
+  # exact data questions first — real numbers straight from novrix
+  if answer_data_question "$q"; then return 0; fi
+  # privacy-coins mentions (monero, dero, zcash...) → the techleaks analysis
+  if answer_privacy_question "$q"; then return 0; fi
+  # "what's new on crypto?" → the latest chart text from the Telegram channel
+  if answer_telegram_question "$q"; then return 0; fi
+  # otherwise the AI agent, with latest data + web research as context
+  local ctx="" user
+  ctx="$(data_context "$q")"
+  if [[ -z "${NOVRIX_API_DIR:-}" ]] && looks_like_data_question "$q"; then
+    local web
+    web="$(web_research "$q")"
+    [[ -n "$web" ]] && ctx="${ctx:+$ctx
+}$web"
+  fi
+  if [[ -n "$ctx" ]]; then
+    user="$ctx
+
+$q"
+  else
+    user="$q"
+  fi
+  printf '%s\n' "$(spinner_run "let me think..." ai_chat "$AI_SYSTEM" "$user")"
+}
+
+# every name a user can type (aliases, long names, system commands)
+known_commands() {
+  {
+    printf '%s\n' fg fear-greed nupl cpi tvl \
+      defi stablecoins dex fees options dominance prices oi market protocols \
+      bridges lending macro shortcuts aliases map version help clear exit quit q ai ask \
+      telegram tg
+    printf '%s\n' "${!SERIES[@]}" "${!META[@]}" "${!ALIASES[@]}" "${ALIASES[@]}"
+  } | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# typo — the friendly layer. First the troll easter egg (roast instead of
+# resolve), then offline Levenshtein fuzzy matching, then the AI agent on
+# the full phrase so novrix NEVER says "unknown command".
+# ---------------------------------------------------------------------------
+
+# edit distance (Levenshtein) via awk — POSIX, no extra deps
+edit_dist() { # $1 $2 → prints the distance
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    m=length(a); n=length(b)
+    for (i=0;i<=m;i++) d[i,0]=i
+    for (j=0;j<=n;j++) d[0,j]=j
+    for (i=1;i<=m;i++) for (j=1;j<=n;j++){
+      c=(substr(a,i,1)==substr(b,j,1))?0:1
+      x=d[i-1,j]+1; y=d[i,j-1]+1; z=d[i-1,j-1]+c
+      d[i,j]=(x<y?x:y)<z?(x<y?x:y):z
+    }
+    print d[m,n]
+  }'
+}
+
+# best local guess for a mistyped command; prints "" when unsure
+fuzzy_match() {
+  local word
+  word="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ -n "$word" ]] || return 0
+  local maxd=$(( ${#word} / 3 + 1 ))
+  local best="" bestd=999 name d
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    d="$(edit_dist "$word" "$name")"
+    if (( d < bestd )); then bestd=$d; best="$name"; fi
+  done < <(known_commands)
+  # reject self-matches (would loop forever) and matches too far apart —
+  # e.g. 'fear' is 2 edits from 'clear' but only 4 chars, so it must fall
+  # through to the AI instead of "fixing" fear → clear.
+  if (( bestd <= maxd && bestd * 3 <= ${#word} )) && [[ "$best" != "$word" ]]; then
+    printf '%s\n' "$best"
+  fi
+}
+
+# troll easter egg — roast the user instead of resolving their input.
+# Returns 0 when it roasted (nothing more to do), 1 to fall through.
+troll() {
+  local w phrase
+  phrase="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  # politics and people — troll instead of answering, unless crypto-adjacent
+  case "$phrase" in
+    *putin*|*trump*|*biden*|*zelensky*)
+      case "$phrase" in
+        *btc*|*bitcoin*|*crypto*|*price*|*market*|*macro*|*economy*|*gold*|*oil*|*etf*|*tvl*|*mvrv*|*sentiment*|*fed*)
+          : ;;   # crypto-adjacent — let data handling take it
+        *)
+          printf '%s: lol politics? i only track the chain, that aint my lane. try "fg" or "mvrv".\n' "$PROG" >&2
+          return 0 ;;
+      esac ;;
+  esac
+  w="${phrase%% *}"
+  case "$w" in
+    f*cking|f*ckin)
+      printf '%s: you fucking retard 😂 "%s" aint a command. if you meant "funding", type "funding". go on, i dare you.\n' "$PROG" "$1" >&2
+      return 0 ;;
+    f*ck)
+      printf '%s: watch your language lol, family CLI here 😤 type "help" and pretend you can read.\n' "$PROG" >&2
+      return 0 ;;
+    wtf|wth|damn|shit|fuckit)
+      printf '%s: chill lol, "help" is right there. breathe. 😏\n' "$PROG" >&2
+      return 0 ;;
+    stupid|dumb|idiot|moron)
+      printf '%s: calling the CLI names wont make the data come faster 😌 try "fg" or "mvrv", those actually work.\n' "$PROG" >&2
+      return 0 ;;
+  esac
+  return 1
+}
+
+# resolve a mistyped command: local fuzzy on the first word first (instant,
+# offline), then the AI agent on the full phrase — with a "hold on..." spinner
+# while the model works. Exits: 0 = fixed (prints the command), 1 = nothing
+# matched (caller should ask the user), 2 = the AI itself failed (reason was
+# already printed to stderr, so stay quiet)
+resolve_typo() {
+  local word="$1" phrase="${2:-$1}" fixed list ans rc
+  fixed="$(fuzzy_match "$word")"
+  [[ -n "$fixed" ]] && { printf '%s\n' "$fixed"; return 0; }
+  list="$(known_commands | tr '\n' ' ')"
+  ans="$(spinner_run "wtf is \"$phrase\"? hold on..." ai_chat \
+    "Figure out what command the user meant. The input could be a typo, garble, or plain english (like 'mvrvv' -> mvrv, 'fgredd' -> fg, 'fear and greed index' -> fg, 'bitcoin price' -> btc-price, 'prctls' -> prots). Reply with ONLY one exact command name from the list, or exactly UNKNOWN if it aint about any command. Nothing else." \
+    "Commands: $list
+User typed: $phrase" 30 ai_matcher)"
+  rc=$?
+  [[ "$rc" -ne 0 ]] && return 2
+  ans="$(printf '%s' "$ans" | tr -d '[:space:]' | sed 's/[.,;:!?]*$//')"
+  [[ -n "$ans" && "$ans" != "UNKNOWN" && "$ans" != "unknown" ]] || return 1
+  ans="$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')"
+  ans="${ALIASES[$ans]:-$ans}"
+  # exact hit — as long as it isn't just echoing the input back
+  if known_commands | grep -qx "$ans"; then
+    [[ "$ans" == "$word" ]] && return 1
+    printf '%s\n' "$ans"
+    return 0
+  fi
+  # AI was close but not exact — let the local matcher finish the job
+  fixed="$(fuzzy_match "$ans")"
+  if [[ -n "$fixed" && "$fixed" != "$word" ]]; then
+    printf '%s\n' "$fixed"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# commands — usage, version, cheat-sheet, and every cmd_* implementation
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+$PROG $VERSION, market data from novrix.io, right in your terminal.
+
+USAGE
+  $PROG                      Interactive shell, type commands directly
+  $PROG <command> [options]  One-shot mode (also available in the shell)
+
+INTERACTIVE MODE
+  Running $PROG with no arguments opens a shell where every command works
+  without the "$PROG" prefix. Short names are primary, long names work too.
+  $PROG shortcuts prints this map any time.
+  Typos auto-fix. type 'mvvrv' and $PROG runs mvrv for you.
+
+  sentiment   fg nupl mvrv sopr puell rhodl mayer rr rp rpf rpl mcap btc
+              200ma addrs hash scs btoi funding etf
+  macro       cpi unrate gdp nfp claims jolts ccpi pce cpce umich oil
+              t30 curve be dxy gold spx vix ffr m2
+  metrilytics tvl defi mkt stables dex fees dom opts prots bridges lending
+              prices oi
+  system      help clear exit / quit
+
+COMMANDS
+  crypto sentiment, on-chain & market sentiment (novrix.io/sentiment)
+  fg      Fear & Greed index (latest + history)   (fear-greed)
+  nupl    Bitcoin Net Unrealized Profit/Loss
+  mvrv    MVRV Z-Score, market value vs realized value
+  sopr    Spent Output Profit Ratio
+  puell   Puell Multiple
+  rhodl   RHODL Ratio
+  mayer   Mayer Multiple
+  rr      Reserve Risk                            (reserve-risk)
+  rp      Bitcoin realized price                  (realized-price)
+  rpf     Daily realized profit (USD)             (realized-profit)
+  rpl     Daily realized loss (USD)               (realized-loss)
+  mcap    Crypto total market cap                 (market-cap)
+  btc     Bitcoin price                           (btc-price)
+  200ma   200-week moving average                 (200-week-ma)
+  addrs   Daily active addresses                  (active-addresses)
+  hash    Bitcoin network hash rate               (hashrate)
+  scs     Total stablecoin supply                 (stablecoin-supply)
+  btoi    Bitcoin open interest                   (open-interest)
+  funding Perpetual funding rate                  (funding-rate)
+  etf     BTC ETF cumulative flows
+
+  macro, US macroeconomics via FRED (novrix.io/sentiment)
+  cpi     US CPI (CPIAUCSL), MoM / YoY
+  unrate  US unemployment rate
+  gdp     Real GDP (billions of chained dollars)
+  nfp     Nonfarm payrolls (thousands)            (payrolls)
+  claims  Initial jobless claims
+  jolts   JOLTS job openings (thousands)          (job-openings)
+  ccpi    Core CPI (CPILFESL)                     (core-cpi)
+  pce     PCE price index
+  cpce    Core PCE price index                    (core-pce)
+  umich   University of Michigan consumer sentiment
+  oil     WTI crude oil spot (\$/bbl)
+  t30     30-year Treasury yield                  (us30y)
+  curve   10Y - 2Y yield spread                   (t10y2y)
+  be      10-year breakeven inflation rate        (breakeven)
+  dxy     US dollar index (DXY)
+  gold    Gold spot (\$/oz)
+  spx     S&P 500 index                           (sp500)
+  vix     VIX volatility index
+  ffr     Effective federal funds rate            (fedfunds)
+  m2      M2 money supply
+
+  metrilytics, DeFi & markets dashboard (novrix.io/metrilytics)
+  tvl     DeFi TVL per chain (with 7-day change)
+  defi    Total DeFi TVL snapshot, top chain & protocol
+  mkt     Market cap, 24h volume, BTC dominance   (market)
+  stables Total stablecoin supply                 (stablecoins)
+  dex     24h DEX volume
+  fees    Protocol fees & revenue (24h)
+  dom     BTC / ETH / SOL dominance               (dominance)
+  opts    24h options volume                      (options)
+  prots   Top protocols by TVL                    (protocols)
+  bridges Top bridges by TVL
+  lending Top lending protocols by TVL
+  prices  BTC / ETH / SOL spot
+  oi      BTC & DeFi perp open interest
+
+  system
+  shortcuts  Show the short-name command map (aliases, map)
+  ai         Ask the DeepSeek AI agent anything (ask)
+  telegram   Latest post from your Telegram channel
+             (t.me/s/<channel>, no API key - 'what's new on crypto?' answers it)
+  help       Show this help
+  clear      Clear the screen (interactive mode)
+  exit/quit  Leave (interactive mode)
+
+  Typo? $PROG auto-fixes it. 'mvvrv' runs mvrv, 'spr' runs sopr, 'MVRV'
+  runs mvrv. Local fuzzy matching first, then the AI agent for hard cases.
+
+OPTIONS
+  --json          Print the raw API JSON response instead of the table
+  --fresh         Bypass the local response cache
+  --days N        Recent N data points   (series commands, e.g. mvrv, unrate)
+  --months N      Same as --days         (macro monthly series)
+  --top N         Show top N rows        (tvl, prots, bridges, lending)
+  --help, -h      Show this help
+  --version, -v   Show version
+
+ENVIRONMENT
+  NOVRIX_API_BASE      Override the API base URL (default: https://novrix.io)
+  NOVRIX_TTL           Response cache TTL in seconds (default: 300)
+  NOVRIX_TELEGRAM_CHANNEL  Telegram channel for 'what's new on crypto?'
+                          (or TELEGRAM_CHANNEL= in ~/.config/novrix/keys.conf)
+  DEEPSEEK_API_KEY     DeepSeek key for the AI agent (or ~/.config/novrix/keys.conf)
+  DEEPSEEK_API_BASE    DeepSeek API base (default: https://api.deepseek.com)
+
+EXAMPLES
+  $PROG fg
+  $PROG mvrv --days 30
+  $PROG btc          # same as 'btc-price'
+  $PROG rr           # same as 'reserve-risk'
+  $PROG macro cpi --months 24
+  $PROG unrate
+  $PROG tvl --top 5
+  $PROG prots --top 10
+  $PROG dom
+  $PROG shortcuts
+  $PROG ai "explain MVRV in one sentence"
+  $PROG mvvrv             # typo? auto-fixed, runs mvrv
+
+Market data needs no API key. The AI agent needs DEEPSEEK_API_KEY (see
+~/.config/novrix/keys.conf). Responses are cached locally, please don't
+hammer novrix.io.
+EOF
+}
+
+print_version() {
+  printf '%s %s, CLI for NOVRIX public market data (novrix.io)\n' "$PROG" "$VERSION"
+}
+
+# print the short -> full command map (cheat sheet)
+cmd_shortcuts() {
+  cat <<EOF
+$PROG shortcuts, every command, shortest form first.
+Long names still work everywhere.
+
+crypto sentiment
+  fg      fear & greed      sopr    sopr               rhodl   rhodl ratio
+  nupl    nupl              puell   puell multiple     mayer   mayer multiple
+  mvrv    mvrv z-score      rr      reserve-risk       rp      realized price
+  rpf     realized profit   rpl     realized loss      mcap    market cap
+  btc     btc price         200ma   200-week ma        addrs   active addresses
+  hash    hashrate          scs     stablecoin supply  btoi    btc open interest
+  funding funding rate      etf     btc etf flows
+
+macro
+  cpi     cpi               unrate  unemployment       gdp     gdp
+  nfp     nonfarm payrolls  claims  jobless claims     jolts   job openings
+  ccpi    core cpi          pce     pce                cpce    core pce
+  umich   u.mich sentiment  oil     wti oil            t30     30y yield
+  curve   10y-2y spread     be      breakeven          dxy     dollar index
+  gold    gold              spx     s&p 500            vix     vix
+  ffr     fed funds rate    m2      m2 supply
+
+metrilytics
+  tvl     tvl per chain     defi    defi tvl           mkt     market
+  stables stablecoin supply dex     24h dex volume     fees    protocol fees
+  dom     dominance         opts    options volume     prots   top protocols
+  bridges bridges           lending lending            prices  btc/eth/sol spot
+  oi      open interest
+
+system · ai · help · clear · exit
+
+Typos auto-fix: 'mvvrv' -> mvrv, 'spr' -> sopr, 'MVRV' -> mvrv.
+$PROG <short> --help shows the full help. $PROG shortcuts repeats this list.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# telegram — latest posts from a public Telegram channel (t.me/s, no key)
+# ---------------------------------------------------------------------------
+cmd_telegram() {
+  local channel n=1 out
+  channel="$(tg_channel)"
+  [[ -n "$channel" ]] \
+    || die "no telegram channel set - export NOVRIX_TELEGRAM_CHANNEL=your-channel or add 'TELEGRAM_CHANNEL=your-channel' to $KEYS_FILE"
+  if [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; then n="$1"; shift; fi
+  parse_opts "$@"
+  out="$(tg_fetch "$channel" | tg_parse)"
+  [[ -n "$out" ]] || die "no posts found on @$channel"
+  printf '%s' "$out" | tg_show "$channel" "$n"
+}
+
+# ---------------------------------------------------------------------------
+# fg — Fear & Greed
+# ---------------------------------------------------------------------------
+cmd_fg() {
+  local days="${opt_days:-1}"
+  pos_int "$days" "--days"
+  local body
+  body="$(api_get "/api/fear-greed?days=3000")"
+  emit_json "$body" && return 0
+
+  local latest_score latest_label latest_date
+  IFS=$'\t' read -r latest_score latest_label latest_date < <(
+    jq -r '.data | sort_by(.timestamp) | .[-1] | [.score, .label, .timestamp[0:10]] | @tsv' <<<"$body")
+
+  # default view: one compact line with the score and zone
+  if (( days == 1 )); then
+    printf '%sFEAR & GREED%s · %s%s/100%s (%s) · %s\n' \
+      "$c_bold" "$c_reset" \
+      "$(fg_col "$latest_score")" "$latest_score" "$c_reset" \
+      "$latest_label" "$latest_date"
+    return 0
+  fi
+
+  printf '%sFEAR & GREED INDEX%s · latest: %s%s/100%s (%s) · %s\n' \
+    "$c_bold" "$c_reset" \
+    "$(fg_col "$latest_score")" "$latest_score" "$c_reset" \
+    "$latest_label" "$latest_date"
+
+  printf '%-12s %6s  %-14s\n' "DATE" "SCORE" "ZONE"
+  hr 34
+  jq -r --argjson days "$days" '
+    .data | sort_by(.timestamp) | .[-($days):][]
+    | [.timestamp[0:10], (.score|tostring), .label] | @tsv' <<<"$body" \
+    | while IFS=$'\t' read -r date score label; do
+        local col=""
+        case "$label" in
+          "Extreme Fear") col="$c_red" ;;
+          "Fear") col="$c_yellow" ;;
+          "Greed") col="$c_green" ;;
+          "Extreme Greed") col="$c_bold$c_green" ;;
+        esac
+        printf '%-12s %s%6s%s  %b%-14s%b\n' \
+          "$date" "$(fg_col "$score")" "$score" "$c_reset" \
+          "$col" "$label" "$c_reset"
+      done
+}
+
+# ---------------------------------------------------------------------------
+# nupl — Net Unrealized Profit/Loss
+# ---------------------------------------------------------------------------
+cmd_nupl() {
+  local days="${opt_days:-1}"
+  pos_int "$days" "--days"
+  local body
+  body="$(api_get "/api/nupl")"
+  emit_json "$body" && return 0
+
+  local lv_m lv ldate
+  IFS=$'\t' read -r lv_m lv ldate < <(
+    jq -r '.data | sort_by(.time) | .[-1] | [((.net_unrealized_profit_loss*1000)|round), (.net_unrealized_profit_loss|tostring), .time[0:10]] | @tsv' <<<"$body")
+
+  # default view: one compact line
+  if (( days == 1 )); then
+    printf '%sNUPL%s · %s (%s) · %s\n' "$c_bold" "$c_reset" "$lv" "$(nupl_zone "$lv_m")" "$ldate"
+    return 0
+  fi
+
+  printf '%sNUPL%s, NET UNREALIZED PROFIT/LOSS · latest: %s (%s) · %s\n' \
+    "$c_bold" "$c_reset" "$lv" "$(nupl_zone "$lv_m")" "$ldate"
+
+  printf '%-12s %8s  %-16s\n' "DATE" "NUPL" "ZONE"
+  hr 38
+  jq -r --argjson days "$days" '
+    .data | sort_by(.time) | .[-($days):][]
+    | [.time[0:10], ((.net_unrealized_profit_loss*1000)|round), (.net_unrealized_profit_loss|tostring)] | @tsv' <<<"$body" \
+    | while IFS=$'\t' read -r date mv val; do
+        local zone col
+        zone="$(nupl_zone "$mv")"
+        case "$zone" in
+          Euphoria|Greed) col="$c_green" ;;
+          Optimism) col="$c_reset" ;;
+          Anxiety) col="$c_yellow" ;;
+          Fear|Capitulation) col="$c_red" ;;
+        esac
+        printf '%-12s %8s  %b%-16s%b\n' "$date" "$val" "$col" "$zone" "$c_reset"
+      done
+  printf '\n%sZones: Euphoria ≥ 0.50 · Greed ≥ 0.25 · Optimism ≥ 0 · Anxiety ≥ -0.25 · Fear ≥ -0.50 · Capitulation < -0.50%s\n' "$c_dim" "$c_reset"
+}
+
+# ---------------------------------------------------------------------------
+# cpi — US CPI (FRED / CPIAUCSL)
+# ---------------------------------------------------------------------------
+cmd_cpi() {
+  local months="${opt_months:-1}"
+  pos_int "$months" "--months"
+  local body
+  body="$(api_get "/api/fred-cpiaucsl")"
+  emit_json "$body" && return 0
+
+  # default view: one compact line with latest CPI + MoM/YoY
+  if (( months == 1 )); then
+    local line
+    line="$(jq -r '
+      def p2: (.*100|round)/100;
+      .data | sort_by(.time) as $all | $all[-1] as $cur
+      | (if ($all|length) >= 2 then $all[-2] else null end) as $prev
+      | (if ($all|length) >= 13 then $all[-13] else null end) as $yoy
+      | ($cur.value|tostring)
+        + " " + $cur.time[0:7]
+        + " " + (if $prev then (($cur.value-$prev.value)/$prev.value*100|p2|tostring) else "nan" end)
+        + " " + (if $yoy then (($cur.value-$yoy.value)/$yoy.value*100|p2|tostring) else "nan" end)' <<<"$body")"
+    local val mon mom yoy
+    IFS=$' ' read -r val mon mom yoy <<<"$line"
+    printf '%sUS CPI%s · %s · MoM %s · YoY %s · %s\n' "$c_bold" "$c_reset" "$val" "$(fmtpct "$mom")" "$(fmtpct "$yoy")" "$mon"
+    return 0
+  fi
+
+  local latest_val latest_mon
+  IFS=$'\t' read -r latest_val latest_mon < <(
+    jq -r '.data | sort_by(.time) | .[-1] | [ (.value|tostring), .time[0:7] ] | @tsv' <<<"$body")
+  printf '%sUS CPI%s, CPIAUCSL (FRED, monthly) · latest: %s · %s\n' "$c_bold" "$c_reset" "$latest_val" "$latest_mon"
+
+  printf '%-10s %10s  %9s  %9s\n' "MONTH" "CPI" "MoM %" "YoY %"
+  jq -r --argjson m "$months" '
+    def p2: (.*100|round)/100;
+    .data | sort_by(.time) as $all
+    | ($all|length) as $L
+    | $all[-($m):] as $w
+    | range(0; ($w|length)) as $i
+    | $w[$i] as $cur
+    | (if ($L - $m + $i - 1) >= 0 then $all[$L - $m + $i - 1] else null end) as $prev
+    | (if ($L - $m + $i - 12) >= 0 then $all[$L - $m + $i - 12] else null end) as $yoy
+    | [ $cur.time[0:7],
+        ($cur.value|tostring),
+        (if $prev then (($cur.value-$prev.value)/$prev.value*100|p2|tostring) else "nan" end),
+        (if $yoy then (($cur.value-$yoy.value)/$yoy.value*100|p2|tostring) else "nan" end) ] | @tsv' <<<"$body" \
+    | while IFS=$'\t' read -r mon val mom yoy; do
+        printf '%-10s %10s  %8s  %8s\n' "$mon" "$val" "$(pct "$mom")" "$(pct "$yoy")"
+      done
+}
+
+# ---------------------------------------------------------------------------
+# tvl — DeFi total value locked per chain
+# ---------------------------------------------------------------------------
+cmd_tvl() {
+  local top="${opt_top:-10}"
+  pos_int "$top" "--top"
+  local body
+  body="$(api_get "/api/metrilytics/chains")"
+  emit_json "$body" && return 0
+
+  # default view: one compact line with total + top chain
+  if [[ -z "${opt_top:-}" ]]; then
+    local line
+    line="$(jq -r "$JQ_ABBR"'
+      [ .chains[] as $c | { chain: $c, tvl: (((.tvl[$c] // [])[-1].tvl) // 0) } ] as $rows
+      | ($rows | map(.tvl) | add) as $total
+      | ($rows | sort_by(-.tvl) | .[0]) as $topc
+      | "TVL · $" + ($total|abbr) + " · " + ((.chains|length)|tostring) + " chains · top: " + $topc.chain + " $" + ($topc.tvl|abbr)' <<<"$body")"
+    printf '%s%s%s\n' "$c_bold" "$line" "$c_reset"
+    return 0
+  fi
+
+  printf '%-12s %14s  %8s  %8s\n' "CHAIN" "TVL (USD)" "7D %" "SHARE"
+  jq -r --argjson top "$top" "$JQ_ABBR"'
+    [ .chains[] as $c | {
+        chain: $c,
+        cur: (((.tvl[$c] // [])[-1].tvl) // 0),
+        prev: ((((.tvl[$c] // [])[-8].tvl) // (((.tvl[$c] // [])[0].tvl) // 0)))
+      } ]
+    | sort_by(-.cur)
+    | .[0:($top)] as $rows
+    | ($rows | map(.cur) | add) as $total
+    | $rows[]
+    | [ .chain,
+        ("$" + (.cur|abbr)),
+        ((if .prev > 0 then ((.cur - .prev)/.prev*100) else 0 end) as $d
+          | (if $d >= 0 then "+" else "" end) + ((($d*100)|round)/100|tostring)),
+        ((if $total > 0 then (.cur/$total*100) else 0 end) as $s
+          | (((($s*100)|round)/100)|tostring)) ] | @tsv' <<<"$body" \
+    | while IFS=$'\t' read -r chain tvl d7 share; do
+        printf '%-12s %14s  %7s%%  %6s%%\n' "$chain" "$tvl" "$d7" "$share"
+      done
+
+  local nchains tot
+  nchains="$(jq -r '.chains|length' <<<"$body")"
+  tot="$(jq -r "$JQ_ABBR"' [ .chains[] as $c | (((.tvl[$c] // [])[-1].tvl) // 0) ] | add // 0 | ("$" + abbr)' <<<"$body")"
+  printf '\n%sTOTAL (all %s chains): %s  ·  window: %s days  ·  source: novrix.io (DeFiLlama)%s\n' \
+    "$c_dim" "$nchains" "$tot" "$(jq -r '.days // "-"' <<<"$body")" "$c_reset"
+}
+
+# ---------------------------------------------------------------------------
+# generic series (driven by the SERIES registry in data.sh)
+# ---------------------------------------------------------------------------
+# shellcheck disable=SC2016  # tcol/ve build jq programs, $r/$v stay literal
+cmd_series() {
+  local name="$1"
+  local entry="${SERIES[$name]:-}"
+  [[ -n "$entry" ]] || die "internal error: no series '$name'"
+  local path field label fmt unit period
+  IFS='|' read -r path field label fmt unit period <<<"$entry"
+  local body
+  body="$(api_get "$path")"
+  emit_json "$body" && return 0
+
+  local n="${opt_days:-${opt_months:-1}}"
+  pos_int "$n" "--days/--months"
+  local ve tcol
+  ve="$(series_val_expr "$fmt")"
+  tcol='$r.time[0:10]'
+  [[ "$period" == "monthly" ]] && tcol='$r.time[0:7]'
+
+  if (( n <= 1 )); then
+    local line val date
+    line="$(jq -r --arg field "$field" "$JQ_ABBR"'
+      .data | sort_by(.time) | .[-1] as $r | $r[$field] as $v
+      | [ '"$ve"', '"$tcol"' ] | @tsv' <<<"$body")"
+    IFS=$'\t' read -r val date <<<"$line"
+    [[ -n "$unit" ]] && unit=" $unit"
+    printf '%s%s%s · %s%s%s%s · %s\n' "$c_bold" "$label" "$c_reset" "$(sign_col "$val")" "$val" "$unit" "$c_reset" "$date"
+    return 0
+  fi
+
+  local latest
+  latest="$(jq -r --arg field "$field" "$JQ_ABBR"'
+    .data | sort_by(.time) | .[-1] as $r | $r[$field] as $v
+    | '"$ve"' + "\t" + '"$tcol"'' <<<"$body")"
+  local lval ldate unitpad
+  IFS=$'\t' read -r lval ldate <<<"$latest"
+  unitpad=""
+  [[ -n "$unit" ]] && unitpad=" $unit"
+  printf '%s%s%s, last %s · latest: %s%s · %s\n' \
+    "$c_bold" "$label" "$c_reset" "$n" "$lval" "$unitpad" "$ldate"
+  printf '%-10s %16s\n' "DATE" "VALUE"
+  hr 27
+  jq -r --argjson n "$n" --arg field "$field" "$JQ_ABBR"'
+    .data | sort_by(.time) | .[-($n):][] as $r | $r[$field] as $v
+    | [ '"$tcol"', ('"$ve"') ] | @tsv' <<<"$body" \
+    | while IFS=$'\t' read -r d v; do
+        printf '%-10s %s%16s%s\n' "$d" "$(sign_col "$v")" "$v" "$c_reset"
+      done
+}
+
+# ---------------------------------------------------------------------------
+# metrilytics — summary one-liners, market snapshot, rankings
+# ---------------------------------------------------------------------------
+cmd_meta() {
+  local name="$1"
+  local prog="${META[$name]:-}"
+  [[ -n "$prog" ]] || die "internal error: no metrilytics command '$name'"
+  local body
+  body="$(api_get "/api/metrilytics?v=$META_V")"
+  emit_json "$body" && return 0
+  local line
+  line="$(jq -r "$JQ_ABBR$JQ_META$prog" <<<"$body")"
+  printf '%s%s%s\n' "$c_bold" "$line" "$c_reset"
+}
+
+cmd_market() {
+  local body
+  body="$(api_get "/api/metrilytics/market?v=$META_V")"
+  emit_json "$body" && return 0
+  local line
+  line="$(jq -r "$JQ_ABBR"'
+    "MARKET · cap $" + (.market.total_market_cap_usd|abbr)
+      + " · 24h vol $" + (.market.total_volume_24h_usd|abbr)
+      + " · BTC dom " + ((.market.btc_dominance*100|round)/100|tostring) + "%"
+      + " · " + .market.date' <<<"$body")"
+  printf '%s%s%s\n' "$c_bold" "$line" "$c_reset"
+}
+
+# SC2016: rowprog is a jq program ($root/$top must stay literal)
+# SC2059: rowfmt/foot are internal format strings, data arrives as arguments
+# shellcheck disable=SC2016,SC2059
+cmd_rank() {
+  local name="$1"
+  local path label rowfmt foot rowprog
+  case "$name" in
+    protocols)
+      path="/api/metrilytics/protocols?limit=80&v=$META_V"
+      label="PROTOCOLS"
+      rowfmt='%-4s %-22s %-12s %14s  %7s%%\n'
+      foot='Source: novrix.io/api/metrilytics/protocols · %s protocols'
+      rowprog='[ .protocols[] | select(.tvl_usd != null) ] | sort_by(-.tvl_usd)
+        | .[0:($top)] as $rows | ($rows | map(.tvl_usd) | add) as $total
+        | $rows | to_entries[]
+        | [ (.key+1|tostring),
+            (.value.protocol[0:22]),
+            ((.value.category // "-")[0:12]),
+            ("$" + (.value.tvl_usd|abbr)),
+            (((.value.tvl_usd/$total*100*100|round)/100|tostring)) ] | @tsv'
+      ;;
+    bridges)
+      path="/api/metrilytics/bridges?limit=50&v=$META_V"
+      label="BRIDGES"
+      rowfmt='%-4s %-22s %-14s %14s\n'
+      foot='Source: novrix.io/api/metrilytics/bridges · total $%s'
+      rowprog='[ .protocols[] | select(.tvl_usd != null) ] | sort_by(-.tvl_usd)
+        | .[0:($top)] | to_entries[]
+        | [ (.key+1|tostring),
+            (.value.protocol[0:22]),
+            ((.value.chain // "-")[0:14]),
+            ("$" + (.value.tvl_usd|abbr)) ] | @tsv'
+      ;;
+    lending)
+      path="/api/metrilytics/lending?limit=50&v=$META_V"
+      label="LENDING"
+      rowfmt='%-4s %-20s %-12s %14s  %14s  %14s\n'
+      foot='Source: novrix.io/api/metrilytics/lending · total $%s'
+      rowprog='[ .protocols[] | select(.tvl_usd != null) ] | sort_by(-.tvl_usd)
+        | .[0:($top)] | to_entries[]
+        | [ (.key+1|tostring),
+            (.value.protocol[0:20]),
+            ((.value.chain // "-")[0:12]),
+            ("$" + (.value.tvl_usd|abbr)),
+            ("$" + ((.value.supplied_usd // 0)|abbr)),
+            ("$" + ((.value.borrowed_usd // 0)|abbr)) ] | @tsv'
+      ;;
+    *) die "internal error: no ranking '$name'" ;;
+  esac
+
+  local top="${opt_top:-10}"
+  pos_int "$top" "--top"
+  local body
+  body="$(api_get "$path")"
+  emit_json "$body" && return 0
+
+  # default view: one compact line
+  if [[ -z "${opt_top:-}" ]]; then
+    local line
+    if [[ "$name" == "protocols" ]]; then
+      line="$(jq -r "$JQ_ABBR"'
+        . as $root | $root.protocols | sort_by(-.tvl_usd) | .[0] as $t
+        | "PROTOCOLS · " + ($root.count|tostring) + " tracked · top: " + $t.protocol + " $" + ($t.tvl_usd|abbr)' <<<"$body")"
+    else
+      line="$(jq -r "$JQ_ABBR"'
+        . as $root | $root.protocols | sort_by(-.tvl_usd) | .[0] as $t
+        | "'"$label"'" + " · total $" + ($root.total|abbr) + " · top: " + $t.protocol + " $" + ($t.tvl_usd|abbr)' <<<"$body")"
+    fi
+    printf '%s%s%s\n' "$c_bold" "$line" "$c_reset"
+    return 0
+  fi
+
+  case "$name" in
+    protocols) printf '%-4s %-22s %-12s %14s  %8s\n' "RANK" "PROTOCOL" "CATEGORY" "TVL (USD)" "SHARE" ;;
+    bridges)   printf '%-4s %-22s %-14s %14s\n'   "RANK" "BRIDGE" "CHAIN" "TVL (USD)" ;;
+    lending)   printf '%-4s %-20s %-12s %14s  %14s  %14s\n' "RANK" "PROTOCOL" "CHAIN" "TVL (USD)" "SUPPLIED" "BORROWED" ;;
+  esac
+  jq -r --argjson top "$top" "$JQ_ABBR$rowprog" <<<"$body" \
+    | while IFS=$'\t' read -r rank a b c d e f; do
+        case "$name" in
+          protocols) printf "$rowfmt" "$rank" "$a" "$b" "$c" "$d" ;;
+          bridges)   printf "$rowfmt" "$rank" "$a" "$b" "$c" ;;
+          lending)   printf "$rowfmt" "$rank" "$a" "$b" "$c" "$d" "$e" "$f" ;;
+        esac
+      done
+  local footval
+  if [[ "$name" == "protocols" ]]; then
+    footval="$(jq -r '.count' <<<"$body")"
+  else
+    footval="$(jq -r "$JQ_ABBR"'.total|abbr' <<<"$body")"
+  fi
+  printf '\n%s%s%s\n' "$c_dim" "$(printf "$foot" "$footval")" "$c_reset"
+}
+
+# ---------------------------------------------------------------------------
+# cli — command dispatch, interactive REPL, and the entry point
+# ---------------------------------------------------------------------------
+
+# dispatch a single command line — shared by one-shot and interactive mode
+run_command() {
+  local cmd="${1:-}"
+  local fixed="" phrase="" rc=0
+  if (( $# > 0 )); then shift; fi
+
+  # tolerate a leading binary name in one-shot mode: `novrix novrix ai hello`
+  if [[ "$cmd" == "$PROG" ]]; then
+    cmd="${1:-}"
+    (( $# > 0 )) && shift
+  fi
+
+  # resolve short aliases (rr, btc, spx, dom, …) to canonical names first
+  cmd="${ALIASES[$cmd]:-$cmd}"
+  # commands are case-insensitive: MVRV, Fear, SPX all work
+  cmd="$(printf '%s' "$cmd" | tr '[:upper:]' '[:lower:]')"
+  # drop punctuation a user might paste along with the command (ai,, fg.) —
+  # keep a trailing ? so question detection still works on one-shot phrases
+  while [[ "$cmd" == *[.,!] ]]; do
+    cmd="${cmd%[.,!]}"
+  done
+  if [[ -z "$cmd" ]]; then usage; return 0; fi
+
+  # a known command with a date or range in plain language ("nupl for 2014,
+  # 15 january", "fg from 10 january to 20 january, 2022") → answer with the
+  # exact historical data instead of running the command and ignoring the
+  # extra words
+  if [[ -n "$*" ]] && [[ "$*" != -* ]]; then
+    local nphrase="$cmd${*:+ $*}"
+    if ( extract_date "$nphrase" || extract_range "$nphrase" || extract_count "$nphrase" ) >/dev/null 2>&1 \
+       && detect_data_series "$nphrase" >/dev/null 2>&1; then
+      if answer_data_question "$nphrase"; then
+        return 0
+      fi
+      # a known metric with a date/range, but the point is not in novrix
+      # history (e.g. funding rate in 2014) → the agent explains instead of
+      # the command choking on the extra words
+      cmd_ai "$nphrase"
+      return 0
+    fi
+  fi
+
+  # a known command followed by natural language that is not options —
+  # "spx looking good, what's it's price?" — answer with the exact latest
+  # data, or hand the phrase to the AI agent, instead of option parsing
+  # choking on the words ("unknown option: looking")
+  if [[ -n "$*" ]]; then
+    local arg ok=1
+    for arg in "$@"; do [[ "$arg" != -* ]] || ok=0; done
+    if (( ok )) && known_commands | grep -qx "$cmd"; then
+      local nphrase="$cmd${*:+ $*}"
+      if answer_data_question "$nphrase"; then
+        return 0
+      fi
+      if looks_like_question "$nphrase" || looks_like_chat "$nphrase"; then
+        cmd_ai "$nphrase"
+        return 0
+      fi
+    fi
+  fi
+
+  case "$cmd" in
+    macro)
+      local sub="${1:-}"
+      if (( $# > 0 )); then shift; fi
+      case "$sub" in
+        cpi) parse_opts "$@"; cmd_cpi ;;
+        "")  die "missing subcommand, use '$PROG macro cpi'" ;;
+        *)
+          if looks_like_chat "$sub" || looks_like_question "$sub"; then
+            cmd_ai "macro $sub${*:+ $*}"   # "macro guy" → the agent answers in persona
+          else
+            die "unknown macro '$sub', supported: cpi"
+          fi
+          ;;
+      esac
+      ;;
+    -h|--help|help) usage ;;
+    -v|--version|version) print_version ;;
+    shortcuts|aliases|map) cmd_shortcuts ;;
+    fg|fear-greed) parse_opts "$@"; cmd_fg ;;
+    nupl) parse_opts "$@"; cmd_nupl ;;
+    cpi) parse_opts "$@"; cmd_cpi ;;      # alias for 'macro cpi'
+    tvl) parse_opts "$@"; cmd_tvl ;;
+    defi|stablecoins|dex|fees|options|dominance|prices|oi) parse_opts "$@"; cmd_meta "$cmd" ;;
+    market) parse_opts "$@"; cmd_market ;;
+    protocols|bridges|lending) parse_opts "$@"; cmd_rank "$cmd" ;;
+    ai|ask) cmd_ai "$@" ;;
+    telegram|tg) cmd_telegram "$@" ;;
+    clear) clear 2>/dev/null || true ;;
+    *)
+      if [[ -n "${SERIES[$cmd]:-}" ]]; then
+        parse_opts "$@"; cmd_series "$cmd"
+      else
+        # mistyped? troll easter egg first, then the novrix channel's stance,
+        # then exact data questions, then privacy-coin mentions (techleaks
+        # analysis), then plain-language questions and casual chat to the AI
+        # agent, then typo fixing
+        phrase="$cmd${*:+ $*}"
+        if troll "$phrase"; then
+          :   # roasted — nothing to resolve
+        elif answer_novrix_question "$phrase"; then
+          :   # "what does novrix think about..." → the channel's own take
+        elif answer_data_question "$phrase"; then
+          :   # answered with exact novrix data — no AI needed
+        elif answer_privacy_question "$phrase"; then
+          :   # dero/monero/zcash... → techleaks analysis, no AI needed
+        elif looks_like_question "$phrase"; then
+          cmd_ai "$phrase"   # the agent answers, trolls off-topic stuff
+        elif looks_like_chat "$phrase"; then
+          cmd_ai "$phrase"   # casual chat — "hey", "macro guy" — it riffs back
+        else
+          fixed="$(resolve_typo "$cmd" "$phrase")" || rc=$?
+          if (( rc == 0 )); then
+            printf '%s: "%s"? you mean "%s". running it.\n' "$PROG" "$phrase" "$fixed" >&2
+            if [[ "$phrase" == "$cmd" ]]; then
+              run_command "$fixed" "$@"   # single word — keep flags like --top
+            else
+              run_command "$fixed"        # multi-word — trailing words were natural language
+            fi
+          elif (( rc == 1 )); then
+            die "lol what even is \"$phrase\"? 😏 i got nothing on that. what did you mean? try '$PROG help' or ask '$PROG ai \"your question\"'."
+          else
+            exit 1   # rc == 2 → the AI agent already explained — stay quiet
+          fi
+        fi
+      fi
+      ;;
+  esac
+}
+
+# interactive mode: bare `novrix` drops you into a REPL
+interactive() {
+  local line last_q=""
+  printf '%s%s %s%s, interactive mode. type a command and hit enter.\n' \
+    "$c_bold" "$PROG" "$VERSION" "$c_reset"
+  printf '\n'
+  printf '  %s%-13s%s %s%s%s\n' "$c_bold" "sentiment" "$c_reset" "$c_dim" \
+    "fg nupl mvrv sopr puell rhodl mayer rr rp rpf rpl mcap btc 200ma addrs hash scs btoi funding etf" "$c_reset"
+  printf '  %s%-13s%s %s%s%s\n' "$c_bold" "macro:" "$c_reset" "$c_dim" \
+    "cpi unrate gdp nfp claims jolts ccpi pce cpce umich oil t30 curve be dxy gold spx vix ffr m2" "$c_reset"
+  printf '  %s%-13s%s %s%s%s\n' "$c_bold" "metrilytics" "$c_reset" "$c_dim" \
+    "tvl defi mkt stables dex fees dom opts prots bridges lending prices oi" "$c_reset"
+  printf '  %s%-13s%s %s%s%s\n' "$c_bold" "ai" "$c_reset" "$c_dim" \
+    "ask anything, it answers with real data" "$c_reset"
+  printf '  %s%-13s%s %s%s%s\n' "$c_bold" "telegram" "$c_reset" "$c_dim" \
+    "what's new on crypto? - your latest chart text" "$c_reset"
+  printf '  %s%-13s%s %s%s%s\n' "$c_bold" "system" "$c_reset" "$c_dim" \
+    "shortcuts · help · clear · exit" "$c_reset"
+  printf '  %s%-13s%s %s\n' "$c_dim" "tip:" "$c_reset" \
+    "dates and ranges work anywhere - 'nupl for 2014, 15 january', 'last 10 days of fg'"
+  printf '  %s%-13s%s %s\n' "$c_dim" "tip:" "$c_reset" \
+    "follow-ups inherit the subject - ask 'what about btc price?' then 'for today?'"
+  printf '\n'
+  while true; do
+    IFS= read -r -p "$c_green$PROG>$c_reset " -e line || { printf '\nbye\n'; return 0; }
+    # trim surrounding whitespace
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    # tolerate a pasted binary name: `novrix ai ...` works right in the shell
+    if [[ "$line" == "$PROG"* ]]; then
+      line="${line#"$PROG"}"
+      line="${line# }"
+      if [[ -z "$line" ]]; then usage; continue; fi
+    fi
+    case "$line" in
+      exit|quit|q) printf 'bye\n'; return 0 ;;
+      help|h|\?) usage ;;
+      clear) clear 2>/dev/null || true ;;
+      *)
+        # elliptical follow-ups ("for today?", "what about eth?") inherit the
+        # previous question — without it the AI agent would have to guess
+        # what they refer to and can invent numbers instead of real data.
+        # Skip when the new line names a series itself (normal dispatch wins).
+        if [[ -n "$last_q" ]] \
+           && ! detect_data_series "$line" >/dev/null 2>&1 \
+           && looks_like_followup "$line"; then
+          line="$last_q $line"
+        fi
+        last_q="$line"
+        # run in a subshell so a bad command doesn't kill the REPL
+        # shellcheck disable=SC2086  # word splitting is the point: line -> argv
+        ( run_command $line ) \
+          || printf '%s: command failed, see "help"\n' "$PROG"
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+main() {
+  need_cmd curl
+  need_cmd jq
+
+  # bare `novrix` → interactive shell; `novrix fg` etc. → one-shot
+  if [[ $# -eq 0 ]]; then
+    interactive
+    return 0
+  fi
+
+  run_command "$@"
+}
+
+main "$@"
+
